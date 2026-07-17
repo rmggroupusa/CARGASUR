@@ -370,6 +370,28 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
   res.json({ loads: result.rows });
 });
 
+// Ver las cargas reservadas por el carrier (su historial/record)
+app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, res) => {
+  const result = await query(
+    `SELECT
+       loads.*,
+       bookings.id AS booking_id,
+       bookings.created_at AS booked_at,
+       shipper.id AS shipper_id_ref,
+       shipper.company_name AS shipper_company_name,
+       shipper.email AS shipper_email,
+       shipper.phone AS shipper_phone,
+       shipper.business_address AS shipper_business_address
+     FROM bookings
+     JOIN loads ON loads.id = bookings.load_id
+     JOIN users shipper ON shipper.id = loads.shipper_id
+     WHERE bookings.carrier_id = $1 AND bookings.payment_status = 'paid'
+     ORDER BY bookings.created_at DESC`,
+    [req.user.id]
+  );
+  res.json({ loads: result.rows });
+});
+
 // Reservar una carga (solo carriers)
 // Editar una carga propia (solo shippers, y solo si sigue abierta)
 app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) => {
@@ -413,6 +435,7 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
        VALUES ($1,$2,'subscription','paid',0)`,
       [loadId, req.user.id]
     );
+    sendLoadAssignedEmail(req.user.id, loadId).catch((err) => console.error(err));
     return res.json({ ok: true, message: 'Carga reservada con tu membresia mensual.' });
   }
 
@@ -506,6 +529,79 @@ app.post('/api/billing/portal', requireAuth, async (req, res) => {
 // Funciones que procesan los eventos del webhook
 // ============================================================
 
+function escapeHtmlServer(str){
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatDateServer(d){
+  if (!d) return 'N/A';
+  const str = (d instanceof Date) ? d.toISOString() : String(d);
+  return str.split('T')[0];
+}
+
+async function sendLoadAssignedEmail(carrierId, loadId){
+  try {
+    const result = await query(
+      `SELECT loads.*, carrier.email AS carrier_email,
+              shipper.company_name AS shipper_company_name, shipper.phone AS shipper_phone,
+              shipper.email AS shipper_email, shipper.business_address AS shipper_business_address
+       FROM loads
+       JOIN users carrier ON carrier.id = $1
+       JOIN users shipper ON shipper.id = loads.shipper_id
+       WHERE loads.id = $2`,
+      [carrierId, loadId]
+    );
+    const row = result.rows[0];
+    if (!row) return;
+
+    const pickup = formatDateServer(row.pickup_date);
+    const delivery = formatDateServer(row.delivery_date);
+    const rate = '$' + Number(row.rate || 0).toFixed(2);
+
+    await sendEmail(
+      row.carrier_email,
+      'Load assigned to you / Carga asignada a ti — CargaSur',
+      `<p>You've been assigned the following load:</p>
+       <ul>
+         <li><strong>Route:</strong> ${escapeHtmlServer(row.origin)} &rarr; ${escapeHtmlServer(row.destination)}</li>
+         <li><strong>Equipment:</strong> ${escapeHtmlServer(row.equipment_type)}</li>
+         <li><strong>Miles:</strong> ${row.miles || 'N/A'}</li>
+         <li><strong>Pickup date:</strong> ${pickup}</li>
+         <li><strong>Delivery date:</strong> ${delivery}</li>
+         <li><strong>Rate:</strong> ${rate}</li>
+         <li><strong>Payment terms:</strong> ${escapeHtmlServer(row.payment_terms) || 'N/A'}</li>
+       </ul>
+       <p><strong>Shipper contact:</strong></p>
+       <ul>
+         <li>Company: ${escapeHtmlServer(row.shipper_company_name) || 'N/A'}</li>
+         <li>Phone: ${escapeHtmlServer(row.shipper_phone) || 'N/A'}</li>
+         <li>Email: ${escapeHtmlServer(row.shipper_email)}</li>
+         <li>Address: ${escapeHtmlServer(row.shipper_business_address) || 'N/A'}</li>
+       </ul>
+       <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+       <p>Se te asigno la siguiente carga:</p>
+       <ul>
+         <li><strong>Ruta:</strong> ${escapeHtmlServer(row.origin)} &rarr; ${escapeHtmlServer(row.destination)}</li>
+         <li><strong>Equipo:</strong> ${escapeHtmlServer(row.equipment_type)}</li>
+         <li><strong>Millas:</strong> ${row.miles || 'N/A'}</li>
+         <li><strong>Fecha de recoleccion:</strong> ${pickup}</li>
+         <li><strong>Fecha de entrega:</strong> ${delivery}</li>
+         <li><strong>Tarifa:</strong> ${rate}</li>
+         <li><strong>Terminos de pago:</strong> ${escapeHtmlServer(row.payment_terms) || 'N/A'}</li>
+       </ul>
+       <p><strong>Contacto del shipper:</strong></p>
+       <ul>
+         <li>Empresa: ${escapeHtmlServer(row.shipper_company_name) || 'N/A'}</li>
+         <li>Telefono: ${escapeHtmlServer(row.shipper_phone) || 'N/A'}</li>
+         <li>Correo: ${escapeHtmlServer(row.shipper_email)}</li>
+         <li>Direccion: ${escapeHtmlServer(row.shipper_business_address) || 'N/A'}</li>
+       </ul>`
+    );
+  } catch (err) {
+    console.error('No se pudo enviar el correo de carga asignada:', err);
+  }
+}
+
 async function handleCheckoutCompleted(session) {
   if (session.mode === 'subscription') {
     const userId = session.metadata && session.metadata.user_id;
@@ -518,9 +614,13 @@ async function handleCheckoutCompleted(session) {
     }
   } else if (session.mode === 'payment') {
     const loadId = session.metadata && session.metadata.load_id;
+    const carrierId = session.metadata && session.metadata.carrier_id;
     if (loadId) {
       await query('UPDATE bookings SET payment_status = $1 WHERE stripe_checkout_session_id = $2', ['paid', session.id]);
       await query('UPDATE loads SET status = $1 WHERE id = $2', ['booked', loadId]);
+      if (carrierId) {
+        sendLoadAssignedEmail(carrierId, loadId).catch((err) => console.error(err));
+      }
     }
   }
 }
