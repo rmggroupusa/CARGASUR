@@ -184,6 +184,39 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   res.json({ user: result.rows[0] });
 });
 
+// Completar/actualizar el perfil despues del registro (vehiculo, licencia, EIN, direccion, etc.)
+app.put('/api/auth/profile', requireAuth, async (req, res) => {
+  const {
+    company_name, phone, city, state,
+    mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year, vehicle_plate,
+    license_number, license_state, ein_number, business_address,
+  } = req.body;
+
+  try {
+    const result = await query(
+      `UPDATE users SET
+         company_name = $1, phone = $2, city = $3, state = $4,
+         mc_number = $5, vehicle_type = $6, vehicle_make = $7, vehicle_model = $8,
+         vehicle_year = $9, vehicle_plate = $10, license_number = $11, license_state = $12,
+         ein_number = $13, business_address = $14
+       WHERE id = $15
+       RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
+                 vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
+                 ein_number, business_address, subscription_status, subscription_plan`,
+      [
+        company_name || null, phone || null, city || null, state || null,
+        mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
+        vehicle_year || null, vehicle_plate || null, license_number || null, license_state || null,
+        ein_number || null, business_address || null, req.user.id,
+      ]
+    );
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo actualizar el perfil.' });
+  }
+});
+
 // Solicitar recuperacion de contrasena: siempre responde "ok" (exista o no
 // el correo), para no revelar que correos estan registrados.
 app.post('/api/auth/forgot-password', async (req, res) => {
@@ -271,15 +304,15 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
     return res.status(402).json({ error: 'Necesitas una membresia de Shipper activa para publicar cargas.' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date } = req.body;
+  const { origin, destination, equipment_type, rate, miles, pickup_date, payment_terms } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
-    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null]
+    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, payment_terms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, payment_terms || null]
   );
   res.json({ load: result.rows[0] });
 });
