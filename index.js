@@ -78,16 +78,13 @@ app.use(express.json());
 // ============================================================
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, role, company_name, phone, city, state, mc_number } = req.body;
+  const { email, password, role, company_name, phone, city, state, mc_number, vehicle_type } = req.body;
 
   if (!email || !password || !role) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: email, password, role.' });
   }
   if (!['shipper', 'carrier'].includes(role)) {
     return res.status(400).json({ error: 'El rol debe ser "shipper" o "carrier".' });
-  }
-  if (role === 'carrier' && !mc_number) {
-    return res.status(400).json({ error: 'Los carriers deben indicar su numero MC.' });
   }
 
   try {
@@ -98,10 +95,10 @@ app.post('/api/auth/register', async (req, res) => {
 
     const password_hash = await hashPassword(password);
     const result = await query(
-      `INSERT INTO users (email, password_hash, role, company_name, phone, city, state, mc_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, email, role, company_name, phone, city, state, mc_number, subscription_status`,
-      [email, password_hash, role, company_name || null, phone || null, city || null, state || null, mc_number || null]
+      `INSERT INTO users (email, password_hash, role, company_name, phone, city, state, mc_number, vehicle_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type, subscription_status`,
+      [email, password_hash, role, company_name || null, phone || null, city || null, state || null, mc_number || null, vehicle_type || null]
     );
 
     const user = result.rows[0];
@@ -163,7 +160,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   const result = await query(
-    `SELECT id, email, role, company_name, phone, city, state, mc_number,
+    `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             subscription_status, subscription_plan
      FROM users WHERE id = $1`,
     [req.user.id]
