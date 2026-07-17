@@ -110,8 +110,17 @@ app.post('/api/auth/register', async (req, res) => {
     const roleLabel = role === 'shipper' ? 'Shipper' : 'Carrier';
     sendEmail(
       user.email,
-      'Tu cuenta de CargaSur ya está creada',
-      `<p>Hola${company_name ? ' ' + company_name : ''},</p>
+      'Your CargaSur account is ready / Tu cuenta de CargaSur ya está creada',
+      `<p>Hello${company_name ? ' ' + company_name : ''},</p>
+       <p>This confirms that your CargaSur account was created successfully.</p>
+       <ul>
+         <li><strong>Email:</strong> ${user.email}</li>
+         <li><strong>Role:</strong> ${roleLabel}</li>
+       </ul>
+       <p>You can now log in and start using the platform.</p>
+       <p>If you did not create this account, please ignore this email.</p>
+       <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+       <p>Hola${company_name ? ' ' + company_name : ''},</p>
        <p>Confirmamos que tu cuenta de CargaSur se creó correctamente.</p>
        <ul>
          <li><strong>Correo:</strong> ${user.email}</li>
@@ -186,10 +195,14 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       const resetUrl = `${process.env.FRONTEND_URL}?reset_token=${token}`;
       await sendEmail(
         user.email,
-        'Recupera tu contrasena de CargaSur',
-        `<p>Recibimos una solicitud para restablecer tu contrasena.</p>
-         <p><a href="${resetUrl}">Haz clic aqui para elegir una nueva contrasena</a></p>
-         <p>Este enlace expira en 1 hora. Si tu no pediste esto, puedes ignorar este correo.</p>`
+        'Reset your CargaSur password / Recupera tu contraseña de CargaSur',
+        `<p>We received a request to reset your password.</p>
+         <p><a href="${resetUrl}">Click here to choose a new password</a></p>
+         <p>This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
+         <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+         <p>Recibimos una solicitud para restablecer tu contraseña.</p>
+         <p><a href="${resetUrl}">Haz clic aquí para elegir una nueva contraseña</a></p>
+         <p>Este enlace expira en 1 hora. Si tú no pediste esto, puedes ignorar este correo.</p>`
       );
     }
 
