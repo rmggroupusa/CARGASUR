@@ -7,7 +7,34 @@ const { query } = require('./db');
 const { hashPassword, comparePassword, signToken } = require('./auth');
 const { requireAuth, requireRole } = require('./middleware');
 
+const crypto = require('crypto');
+
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+async function sendEmail(to, subject, html) {
+  if (!process.env.RESEND_API_KEY) {
+    console.warn('RESEND_API_KEY no configurada: no se pudo enviar el correo a', to);
+    return { skipped: true };
+  }
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: process.env.RESEND_FROM_EMAIL || 'CargaSur <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error('Error enviando correo con Resend:', errText);
+  }
+  return res;
+}
 const app = express();
 app.use(cors());
 
@@ -79,6 +106,21 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user = result.rows[0];
     const token = signToken(user);
+
+    const roleLabel = role === 'shipper' ? 'Shipper' : 'Carrier';
+    sendEmail(
+      user.email,
+      'Tu cuenta de CargaSur ya está creada',
+      `<p>Hola${company_name ? ' ' + company_name : ''},</p>
+       <p>Confirmamos que tu cuenta de CargaSur se creó correctamente.</p>
+       <ul>
+         <li><strong>Correo:</strong> ${user.email}</li>
+         <li><strong>Rol:</strong> ${roleLabel}</li>
+       </ul>
+       <p>Ya puedes iniciar sesión y empezar a usar la plataforma.</p>
+       <p>Si tú no creaste esta cuenta, por favor ignora este correo.</p>`
+    ).catch((err) => console.error('No se pudo enviar el correo de bienvenida:', err));
+
     res.json({ token, user });
   } catch (err) {
     console.error(err);
@@ -118,6 +160,78 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     [req.user.id]
   );
   res.json({ user: result.rows[0] });
+});
+
+// Solicitar recuperacion de contrasena: siempre responde "ok" (exista o no
+// el correo), para no revelar que correos estan registrados.
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = (req.body.email || '').trim();
+  if (!email) {
+    return res.status(400).json({ error: 'Falta el correo electronico.' });
+  }
+
+  try {
+    const result = await query('SELECT id, email FROM users WHERE email = $1', [email]);
+    const user = result.rows[0];
+
+    if (user) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
+
+      await query(
+        'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+        [token, expires, user.id]
+      );
+
+      const resetUrl = `${process.env.FRONTEND_URL}?reset_token=${token}`;
+      await sendEmail(
+        user.email,
+        'Recupera tu contrasena de CargaSur',
+        `<p>Recibimos una solicitud para restablecer tu contrasena.</p>
+         <p><a href="${resetUrl}">Haz clic aqui para elegir una nueva contrasena</a></p>
+         <p>Este enlace expira en 1 hora. Si tu no pediste esto, puedes ignorar este correo.</p>`
+      );
+    }
+
+    // Misma respuesta exista o no el correo, por seguridad.
+    res.json({ ok: true, message: 'Si el correo esta registrado, te llegara un enlace para restablecer tu contrasena.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo procesar la solicitud.' });
+  }
+});
+
+// Confirmar recuperacion: recibe el token del correo + la nueva contrasena.
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) {
+    return res.status(400).json({ error: 'Faltan datos: token y password.' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'La contrasena debe tener al menos 6 caracteres.' });
+  }
+
+  try {
+    const result = await query(
+      'SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > now()',
+      [token]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(400).json({ error: 'El enlace es invalido o ya expiro. Solicita uno nuevo.' });
+    }
+
+    const password_hash = await hashPassword(password);
+    await query(
+      'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
+      [password_hash, user.id]
+    );
+
+    res.json({ ok: true, message: 'Contrasena actualizada correctamente.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo restablecer la contrasena.' });
+  }
 });
 
 // ============================================================
