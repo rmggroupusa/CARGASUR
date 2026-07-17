@@ -418,6 +418,22 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
   res.json({ load: result.rows[0] });
 });
 
+// Cancelar (eliminar) una carga propia - solo si sigue abierta, sin reservar
+app.delete('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) => {
+  const loadId = req.params.id;
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.shipper_id !== req.user.id) {
+    return res.status(403).json({ error: 'No puedes eliminar una carga que no es tuya.' });
+  }
+  if (load.status !== 'open') {
+    return res.status(409).json({ error: 'Solo puedes eliminar cargas que sigan abiertas (sin reservar).' });
+  }
+
+  await query('UPDATE loads SET status = $1 WHERE id = $2', ['cancelled', loadId]);
+  res.json({ ok: true, message: 'Carga eliminada correctamente.' });
+});
+
 app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
 
