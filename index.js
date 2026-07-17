@@ -78,7 +78,11 @@ app.use(express.json());
 // ============================================================
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, role, company_name, phone, city, state, mc_number, vehicle_type } = req.body;
+  const {
+    email, password, role, company_name, phone, city, state,
+    mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
+    vehicle_plate, license_number, license_state, ein_number, business_address,
+  } = req.body;
 
   if (!email || !password || !role) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: email, password, role.' });
@@ -95,10 +99,21 @@ app.post('/api/auth/register', async (req, res) => {
 
     const password_hash = await hashPassword(password);
     const result = await query(
-      `INSERT INTO users (email, password_hash, role, company_name, phone, city, state, mc_number, vehicle_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type, subscription_status`,
-      [email, password_hash, role, company_name || null, phone || null, city || null, state || null, mc_number || null, vehicle_type || null]
+      `INSERT INTO users (
+         email, password_hash, role, company_name, phone, city, state,
+         mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
+         vehicle_plate, license_number, license_state, ein_number, business_address
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       RETURNING id, email, role, company_name, phone, city, state,
+                 mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
+                 vehicle_plate, license_number, license_state, ein_number, business_address, subscription_status`,
+      [
+        email, password_hash, role, company_name || null, phone || null, city || null, state || null,
+        mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
+        vehicle_year || null, vehicle_plate || null, license_number || null, license_state || null,
+        ein_number || null, business_address || null,
+      ]
     );
 
     const user = result.rows[0];
@@ -161,7 +176,8 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   const result = await query(
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
-            subscription_status, subscription_plan
+            vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
+            ein_number, business_address, subscription_status, subscription_plan
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -289,6 +305,35 @@ app.get('/api/loads', async (req, res) => {
   sql += ' ORDER BY loads.created_at DESC';
 
   const result = await query(sql, params);
+  res.json({ loads: result.rows });
+});
+
+// Ver las cargas propias de un shipper, con los datos del carrier asignado (si ya fue reservada)
+app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res) => {
+  const result = await query(
+    `SELECT
+       loads.*,
+       bookings.id AS booking_id,
+       bookings.payment_status AS booking_payment_status,
+       carrier.id AS carrier_id,
+       carrier.company_name AS carrier_company_name,
+       carrier.email AS carrier_email,
+       carrier.phone AS carrier_phone,
+       carrier.mc_number AS carrier_mc_number,
+       carrier.vehicle_type AS carrier_vehicle_type,
+       carrier.vehicle_make AS carrier_vehicle_make,
+       carrier.vehicle_model AS carrier_vehicle_model,
+       carrier.vehicle_year AS carrier_vehicle_year,
+       carrier.vehicle_plate AS carrier_vehicle_plate,
+       carrier.license_number AS carrier_license_number,
+       carrier.license_state AS carrier_license_state
+     FROM loads
+     LEFT JOIN bookings ON bookings.load_id = loads.id AND bookings.payment_status = 'paid'
+     LEFT JOIN users carrier ON carrier.id = bookings.carrier_id
+     WHERE loads.shipper_id = $1
+     ORDER BY loads.created_at DESC`,
+    [req.user.id]
+  );
   res.json({ loads: result.rows });
 });
 
