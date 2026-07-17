@@ -304,15 +304,15 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
     return res.status(402).json({ error: 'Necesitas una membresia de Shipper activa para publicar cargas.' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date, payment_terms } = req.body;
+  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
-    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, payment_terms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, payment_terms || null]
+    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null]
   );
   res.json({ load: result.rows[0] });
 });
@@ -371,6 +371,31 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
 });
 
 // Reservar una carga (solo carriers)
+// Editar una carga propia (solo shippers, y solo si sigue abierta)
+app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) => {
+  const loadId = req.params.id;
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.shipper_id !== req.user.id) {
+    return res.status(403).json({ error: 'No puedes editar una carga que no es tuya.' });
+  }
+  if (load.status !== 'open') {
+    return res.status(409).json({ error: 'Solo puedes editar cargas que sigan abiertas (sin reservar).' });
+  }
+
+  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms } = req.body;
+  if (!origin || !destination || !equipment_type || !rate) {
+    return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
+  }
+
+  const result = await query(
+    `UPDATE loads SET origin=$1, destination=$2, equipment_type=$3, rate=$4, miles=$5, pickup_date=$6, delivery_date=$7, payment_terms=$8
+     WHERE id=$9 RETURNING *`,
+    [origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, loadId]
+  );
+  res.json({ load: result.rows[0] });
+});
+
 app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
 
