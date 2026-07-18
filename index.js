@@ -304,15 +304,27 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
     return res.status(402).json({ error: 'Necesitas una membresia de Shipper activa para publicar cargas.' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes } = req.body;
+  const {
+    origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
+    weight, weight_unit, notes, origin_address, destination_address,
+    origin_lat, origin_lng, destination_lat, destination_lng,
+  } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
-    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, weight || null, weight_unit || 'lb', notes || null]
+    `INSERT INTO loads (
+       shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
+       weight, weight_unit, notes, origin_address, destination_address,
+       origin_lat, origin_lng, destination_lat, destination_lng
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+    [
+      req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null,
+      weight || null, weight_unit || 'lb', notes || null, origin_address || null, destination_address || null,
+      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null,
+    ]
   );
   res.json({ load: result.rows[0] });
 });
@@ -405,16 +417,25 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
     return res.status(409).json({ error: 'Solo puedes editar cargas que sigan abiertas (sin reservar).' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes } = req.body;
+  const {
+    origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
+    weight, weight_unit, notes, origin_address, destination_address,
+    origin_lat, origin_lng, destination_lat, destination_lng,
+  } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
     `UPDATE loads SET origin=$1, destination=$2, equipment_type=$3, rate=$4, miles=$5, pickup_date=$6, delivery_date=$7, payment_terms=$8,
-            weight=$9, weight_unit=$10, notes=$11
-     WHERE id=$12 RETURNING *`,
-    [origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, weight || null, weight_unit || 'lb', notes || null, loadId]
+            weight=$9, weight_unit=$10, notes=$11, origin_address=$12, destination_address=$13,
+            origin_lat=$14, origin_lng=$15, destination_lat=$16, destination_lng=$17
+     WHERE id=$18 RETURNING *`,
+    [
+      origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null,
+      weight || null, weight_unit || 'lb', notes || null, origin_address || null, destination_address || null,
+      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null, loadId,
+    ]
   );
   res.json({ load: result.rows[0] });
 });
