@@ -130,6 +130,7 @@ app.post('/api/auth/register', async (req, res) => {
          <li><strong>Role:</strong> ${roleLabel}</li>
        </ul>
        <p>You can now log in and start using the platform.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>
        <p>If you did not create this account, please ignore this email.</p>
        <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
        <p>Hola${company_name ? ' ' + company_name : ''},</p>
@@ -139,6 +140,7 @@ app.post('/api/auth/register', async (req, res) => {
          <li><strong>Rol:</strong> ${roleLabel}</li>
        </ul>
        <p>Ya puedes iniciar sesión y empezar a usar la plataforma.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>
        <p>Si tú no creaste esta cuenta, por favor ignora este correo.</p>`
     ).catch((err) => console.error('No se pudo enviar el correo de bienvenida:', err));
 
