@@ -304,15 +304,15 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
     return res.status(402).json({ error: 'Necesitas una membresia de Shipper activa para publicar cargas.' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms } = req.body;
+  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
-    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null]
+    `INSERT INTO loads (shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+    [req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, weight || null, weight_unit || 'lb', notes || null]
   );
   res.json({ load: result.rows[0] });
 });
@@ -405,15 +405,16 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
     return res.status(409).json({ error: 'Solo puedes editar cargas que sigan abiertas (sin reservar).' });
   }
 
-  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms } = req.body;
+  const { origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms, weight, weight_unit, notes } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
   const result = await query(
-    `UPDATE loads SET origin=$1, destination=$2, equipment_type=$3, rate=$4, miles=$5, pickup_date=$6, delivery_date=$7, payment_terms=$8
-     WHERE id=$9 RETURNING *`,
-    [origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, loadId]
+    `UPDATE loads SET origin=$1, destination=$2, equipment_type=$3, rate=$4, miles=$5, pickup_date=$6, delivery_date=$7, payment_terms=$8,
+            weight=$9, weight_unit=$10, notes=$11
+     WHERE id=$12 RETURNING *`,
+    [origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null, weight || null, weight_unit || 'lb', notes || null, loadId]
   );
   res.json({ load: result.rows[0] });
 });
@@ -573,6 +574,7 @@ async function sendLoadAssignedEmail(carrierId, loadId){
     const pickup = formatDateServer(row.pickup_date);
     const delivery = formatDateServer(row.delivery_date);
     const rate = '$' + Number(row.rate || 0).toFixed(2);
+    const weightStr = row.weight ? `${row.weight} ${row.weight_unit || 'lb'}` : 'N/A';
 
     await sendEmail(
       row.carrier_email,
@@ -582,10 +584,12 @@ async function sendLoadAssignedEmail(carrierId, loadId){
          <li><strong>Route:</strong> ${escapeHtmlServer(row.origin)} &rarr; ${escapeHtmlServer(row.destination)}</li>
          <li><strong>Equipment:</strong> ${escapeHtmlServer(row.equipment_type)}</li>
          <li><strong>Miles:</strong> ${row.miles || 'N/A'}</li>
+         <li><strong>Weight:</strong> ${weightStr}</li>
          <li><strong>Pickup date:</strong> ${pickup}</li>
          <li><strong>Delivery date:</strong> ${delivery}</li>
          <li><strong>Rate:</strong> ${rate}</li>
          <li><strong>Payment terms:</strong> ${escapeHtmlServer(row.payment_terms) || 'N/A'}</li>
+         ${row.notes ? `<li><strong>Notes:</strong> ${escapeHtmlServer(row.notes)}</li>` : ''}
        </ul>
        <p><strong>Shipper contact:</strong></p>
        <ul>
@@ -600,10 +604,12 @@ async function sendLoadAssignedEmail(carrierId, loadId){
          <li><strong>Ruta:</strong> ${escapeHtmlServer(row.origin)} &rarr; ${escapeHtmlServer(row.destination)}</li>
          <li><strong>Equipo:</strong> ${escapeHtmlServer(row.equipment_type)}</li>
          <li><strong>Millas:</strong> ${row.miles || 'N/A'}</li>
+         <li><strong>Peso:</strong> ${weightStr}</li>
          <li><strong>Fecha de recoleccion:</strong> ${pickup}</li>
          <li><strong>Fecha de entrega:</strong> ${delivery}</li>
          <li><strong>Tarifa:</strong> ${rate}</li>
          <li><strong>Terminos de pago:</strong> ${escapeHtmlServer(row.payment_terms) || 'N/A'}</li>
+         ${row.notes ? `<li><strong>Notas:</strong> ${escapeHtmlServer(row.notes)}</li>` : ''}
        </ul>
        <p><strong>Contacto del shipper:</strong></p>
        <ul>
