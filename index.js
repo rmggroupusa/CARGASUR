@@ -102,9 +102,9 @@ app.post('/api/auth/register', async (req, res) => {
       `INSERT INTO users (
          email, password_hash, role, company_name, phone, city, state,
          mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
-         vehicle_plate, license_number, license_state, ein_number, business_address
+         vehicle_plate, license_number, license_state, ein_number, business_address, terms_accepted_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
        RETURNING id, email, role, company_name, phone, city, state,
                  mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
                  vehicle_plate, license_number, license_state, ein_number, business_address, subscription_status`,
@@ -177,7 +177,8 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   const result = await query(
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
-            ein_number, business_address, subscription_status, subscription_plan
+            ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
+            subscription_status, subscription_plan
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -190,24 +191,33 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
     company_name, phone, city, state,
     mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year, vehicle_plate,
     license_number, license_state, ein_number, business_address,
+    attestation_signed, attestation_name,
   } = req.body;
 
   try {
+    // Si ya estaba firmada antes, no permitir "des-firmar"; si se envia una firma nueva, guardar fecha actual.
+    const existing = (await query('SELECT attestation_signed, attestation_signed_at FROM users WHERE id = $1', [req.user.id])).rows[0];
+    const willBeSigned = existing.attestation_signed || !!attestation_signed;
+    const signedAt = existing.attestation_signed_at || (attestation_signed ? new Date() : null);
+
     const result = await query(
       `UPDATE users SET
          company_name = $1, phone = $2, city = $3, state = $4,
          mc_number = $5, vehicle_type = $6, vehicle_make = $7, vehicle_model = $8,
          vehicle_year = $9, vehicle_plate = $10, license_number = $11, license_state = $12,
-         ein_number = $13, business_address = $14
-       WHERE id = $15
+         ein_number = $13, business_address = $14, attestation_signed = $15, attestation_name = $16,
+         attestation_signed_at = $17
+       WHERE id = $18
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
-                 ein_number, business_address, subscription_status, subscription_plan`,
+                 ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
+                 subscription_status, subscription_plan`,
       [
         company_name || null, phone || null, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
         vehicle_year || null, vehicle_plate || null, license_number || null, license_state || null,
-        ein_number || null, business_address || null, req.user.id,
+        ein_number || null, business_address || null, willBeSigned, attestation_name || existing.attestation_name || null,
+        signedAt, req.user.id,
       ]
     );
     res.json({ user: result.rows[0] });
@@ -371,10 +381,19 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.vehicle_year AS carrier_vehicle_year,
        carrier.vehicle_plate AS carrier_vehicle_plate,
        carrier.license_number AS carrier_license_number,
-       carrier.license_state AS carrier_license_state
+       carrier.license_state AS carrier_license_state,
+       carrier.attestation_signed AS carrier_attestation_signed,
+       rating_summary.avg_rating AS carrier_avg_rating,
+       rating_summary.review_count AS carrier_review_count,
+       my_review.rating AS my_review_rating
      FROM loads
      LEFT JOIN bookings ON bookings.load_id = loads.id AND bookings.payment_status = 'paid'
      LEFT JOIN users carrier ON carrier.id = bookings.carrier_id
+     LEFT JOIN LATERAL (
+       SELECT AVG(rating)::numeric(3,1) AS avg_rating, COUNT(*) AS review_count
+       FROM reviews WHERE reviews.carrier_id = carrier.id
+     ) rating_summary ON true
+     LEFT JOIN reviews my_review ON my_review.load_id = loads.id
      WHERE loads.shipper_id = $1
      ORDER BY loads.created_at DESC`,
     [req.user.id]
@@ -402,6 +421,87 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
     [req.user.id]
   );
   res.json({ loads: result.rows });
+});
+
+// Marcar una carga como entregada (solo el carrier que la reservo)
+app.post('/api/loads/:id/deliver', requireAuth, requireRole('carrier'), async (req, res) => {
+  const loadId = req.params.id;
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.status !== 'booked') {
+    return res.status(409).json({ error: 'Solo puedes marcar como entregadas las cargas que esten asignadas.' });
+  }
+
+  const booking = (await query(
+    `SELECT * FROM bookings WHERE load_id = $1 AND carrier_id = $2 AND payment_status = 'paid'`,
+    [loadId, req.user.id]
+  )).rows[0];
+  if (!booking) {
+    return res.status(403).json({ error: 'Esta carga no esta asignada a ti.' });
+  }
+
+  await query('UPDATE loads SET status = $1 WHERE id = $2', ['delivered', loadId]);
+  createNotification(load.shipper_id, loadId, 'load_delivered').catch((err) => console.error(err));
+
+  res.json({ ok: true, message: 'Carga marcada como entregada.' });
+});
+
+// Calificar a un carrier despues de que se entrego la carga (solo el shipper dueno de la carga)
+app.post('/api/loads/:id/review', requireAuth, requireRole('shipper'), async (req, res) => {
+  const loadId = req.params.id;
+  const { rating, comment } = req.body;
+
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'La calificacion debe ser entre 1 y 5.' });
+  }
+
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.shipper_id !== req.user.id) {
+    return res.status(403).json({ error: 'No puedes calificar una carga que no es tuya.' });
+  }
+  if (load.status !== 'delivered') {
+    return res.status(409).json({ error: 'Solo puedes calificar cargas que ya fueron entregadas.' });
+  }
+
+  const booking = (await query('SELECT * FROM bookings WHERE load_id = $1 AND payment_status = \'paid\'', [loadId])).rows[0];
+  if (!booking) return res.status(404).json({ error: 'No se encontro el carrier de esta carga.' });
+
+  const existing = await query('SELECT id FROM reviews WHERE load_id = $1', [loadId]);
+  if (existing.rows.length) {
+    return res.status(409).json({ error: 'Ya calificaste esta carga.' });
+  }
+
+  await query(
+    `INSERT INTO reviews (load_id, shipper_id, carrier_id, rating, comment) VALUES ($1,$2,$3,$4,$5)`,
+    [loadId, req.user.id, booking.carrier_id, rating, comment || null]
+  );
+
+  res.json({ ok: true, message: 'Calificacion guardada correctamente.' });
+});
+
+// Ver el resumen de calificaciones de un carrier (promedio + total de entregas)
+app.get('/api/carriers/:id/rating', async (req, res) => {
+  const carrierId = req.params.id;
+  const result = await query(
+    `SELECT
+       COALESCE(AVG(rating), 0) AS avg_rating,
+       COUNT(*) AS review_count
+     FROM reviews WHERE carrier_id = $1`,
+    [carrierId]
+  );
+  const deliveredCount = await query(
+    `SELECT COUNT(*) AS delivered_count
+     FROM bookings
+     JOIN loads ON loads.id = bookings.load_id
+     WHERE bookings.carrier_id = $1 AND loads.status = 'delivered' AND bookings.payment_status = 'paid'`,
+    [carrierId]
+  );
+  res.json({
+    avg_rating: parseFloat(result.rows[0].avg_rating).toFixed(1),
+    review_count: parseInt(result.rows[0].review_count, 10),
+    delivered_count: parseInt(deliveredCount.rows[0].delivered_count, 10),
+  });
 });
 
 // Reservar una carga (solo carriers)
@@ -456,6 +556,17 @@ app.delete('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, re
   res.json({ ok: true, message: 'Carga eliminada correctamente.' });
 });
 
+async function createNotification(userId, loadId, type){
+  try {
+    await query(
+      `INSERT INTO notifications (user_id, load_id, type) VALUES ($1,$2,$3)`,
+      [userId, loadId, type]
+    );
+  } catch (err) {
+    console.error('No se pudo crear la notificacion:', err);
+  }
+}
+
 app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
 
@@ -474,6 +585,7 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
       [loadId, req.user.id]
     );
     sendLoadAssignedEmail(req.user.id, loadId).catch((err) => console.error(err));
+    createNotification(load.shipper_id, loadId, 'load_assigned').catch((err) => console.error(err));
     return res.json({ ok: true, message: 'Carga reservada con tu membresia mensual.' });
   }
 
@@ -660,9 +772,12 @@ async function handleCheckoutCompleted(session) {
     const carrierId = session.metadata && session.metadata.carrier_id;
     if (loadId) {
       await query('UPDATE bookings SET payment_status = $1 WHERE stripe_checkout_session_id = $2', ['paid', session.id]);
-      await query('UPDATE loads SET status = $1 WHERE id = $2', ['booked', loadId]);
+      const loadResult = await query('UPDATE loads SET status = $1 WHERE id = $2 RETURNING shipper_id', ['booked', loadId]);
       if (carrierId) {
         sendLoadAssignedEmail(carrierId, loadId).catch((err) => console.error(err));
+      }
+      if (loadResult.rows[0]) {
+        createNotification(loadResult.rows[0].shipper_id, loadId, 'load_assigned').catch((err) => console.error(err));
       }
     }
   }
@@ -672,6 +787,36 @@ async function handleSubscriptionChange(subscription) {
   const status = subscription.status === 'active' ? 'active' : 'inactive';
   await query('UPDATE users SET subscription_status = $1 WHERE stripe_customer_id = $2', [status, subscription.customer]);
 }
+
+// ============================================================
+// NOTIFICACIONES
+// ============================================================
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const result = await query(
+    `SELECT notifications.*, loads.origin, loads.destination
+     FROM notifications
+     JOIN loads ON loads.id = notifications.load_id
+     WHERE notifications.user_id = $1
+     ORDER BY notifications.created_at DESC
+     LIMIT 30`,
+    [req.user.id]
+  );
+  res.json({ notifications: result.rows });
+});
+
+app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  await query(
+    'UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.id]
+  );
+  res.json({ ok: true });
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  await query('UPDATE notifications SET is_read = true WHERE user_id = $1', [req.user.id]);
+  res.json({ ok: true });
+});
 
 // ============================================================
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
