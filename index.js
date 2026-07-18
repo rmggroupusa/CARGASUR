@@ -391,9 +391,9 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
      LEFT JOIN users carrier ON carrier.id = bookings.carrier_id
      LEFT JOIN LATERAL (
        SELECT AVG(rating)::numeric(3,1) AS avg_rating, COUNT(*) AS review_count
-       FROM reviews WHERE reviews.carrier_id = carrier.id
+       FROM reviews WHERE reviews.carrier_id = carrier.id AND reviews.review_type = 'shipper_to_carrier'
      ) rating_summary ON true
-     LEFT JOIN reviews my_review ON my_review.load_id = loads.id
+     LEFT JOIN reviews my_review ON my_review.load_id = loads.id AND my_review.review_type = 'shipper_to_carrier'
      WHERE loads.shipper_id = $1
      ORDER BY loads.created_at DESC`,
     [req.user.id]
@@ -412,10 +412,18 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
        shipper.company_name AS shipper_company_name,
        shipper.email AS shipper_email,
        shipper.phone AS shipper_phone,
-       shipper.business_address AS shipper_business_address
+       shipper.business_address AS shipper_business_address,
+       shipper_rating_summary.avg_rating AS shipper_avg_rating,
+       shipper_rating_summary.review_count AS shipper_review_count,
+       my_review.rating AS my_review_of_shipper_rating
      FROM bookings
      JOIN loads ON loads.id = bookings.load_id
      JOIN users shipper ON shipper.id = loads.shipper_id
+     LEFT JOIN LATERAL (
+       SELECT AVG(rating)::numeric(3,1) AS avg_rating, COUNT(*) AS review_count
+       FROM reviews WHERE reviews.shipper_id = shipper.id AND reviews.review_type = 'carrier_to_shipper'
+     ) shipper_rating_summary ON true
+     LEFT JOIN reviews my_review ON my_review.load_id = loads.id AND my_review.review_type = 'carrier_to_shipper'
      WHERE bookings.carrier_id = $1 AND bookings.payment_status = 'paid'
      ORDER BY bookings.created_at DESC`,
     [req.user.id]
@@ -467,14 +475,48 @@ app.post('/api/loads/:id/review', requireAuth, requireRole('shipper'), async (re
   const booking = (await query('SELECT * FROM bookings WHERE load_id = $1 AND payment_status = \'paid\'', [loadId])).rows[0];
   if (!booking) return res.status(404).json({ error: 'No se encontro el carrier de esta carga.' });
 
-  const existing = await query('SELECT id FROM reviews WHERE load_id = $1', [loadId]);
+  const existing = await query('SELECT id FROM reviews WHERE load_id = $1 AND review_type = \'shipper_to_carrier\'', [loadId]);
   if (existing.rows.length) {
     return res.status(409).json({ error: 'Ya calificaste esta carga.' });
   }
 
   await query(
-    `INSERT INTO reviews (load_id, shipper_id, carrier_id, rating, comment) VALUES ($1,$2,$3,$4,$5)`,
+    `INSERT INTO reviews (load_id, shipper_id, carrier_id, review_type, rating, comment) VALUES ($1,$2,$3,'shipper_to_carrier',$4,$5)`,
     [loadId, req.user.id, booking.carrier_id, rating, comment || null]
+  );
+
+  res.json({ ok: true, message: 'Calificacion guardada correctamente.' });
+});
+
+// Calificar al shipper despues de entregar la carga (solo el carrier que la entrego)
+app.post('/api/loads/:id/review-shipper', requireAuth, requireRole('carrier'), async (req, res) => {
+  const loadId = req.params.id;
+  const { rating, comment } = req.body;
+
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'La calificacion debe ser entre 1 y 5.' });
+  }
+
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.status !== 'delivered') {
+    return res.status(409).json({ error: 'Solo puedes calificar cargas que ya fueron entregadas.' });
+  }
+
+  const booking = (await query(
+    `SELECT * FROM bookings WHERE load_id = $1 AND carrier_id = $2 AND payment_status = 'paid'`,
+    [loadId, req.user.id]
+  )).rows[0];
+  if (!booking) return res.status(403).json({ error: 'Esta carga no esta asignada a ti.' });
+
+  const existing = await query('SELECT id FROM reviews WHERE load_id = $1 AND review_type = \'carrier_to_shipper\'', [loadId]);
+  if (existing.rows.length) {
+    return res.status(409).json({ error: 'Ya calificaste esta carga.' });
+  }
+
+  await query(
+    `INSERT INTO reviews (load_id, shipper_id, carrier_id, review_type, rating, comment) VALUES ($1,$2,$3,'carrier_to_shipper',$4,$5)`,
+    [loadId, load.shipper_id, req.user.id, rating, comment || null]
   );
 
   res.json({ ok: true, message: 'Calificacion guardada correctamente.' });
@@ -487,7 +529,7 @@ app.get('/api/carriers/:id/rating', async (req, res) => {
     `SELECT
        COALESCE(AVG(rating), 0) AS avg_rating,
        COUNT(*) AS review_count
-     FROM reviews WHERE carrier_id = $1`,
+     FROM reviews WHERE carrier_id = $1 AND review_type = 'shipper_to_carrier'`,
     [carrierId]
   );
   const deliveredCount = await query(
@@ -502,6 +544,64 @@ app.get('/api/carriers/:id/rating', async (req, res) => {
     review_count: parseInt(result.rows[0].review_count, 10),
     delivered_count: parseInt(deliveredCount.rows[0].delivered_count, 10),
   });
+});
+
+// Ver el resumen de calificaciones de un shipper (promedio + total de cargas entregadas)
+app.get('/api/shippers/:id/rating', async (req, res) => {
+  const shipperId = req.params.id;
+  const result = await query(
+    `SELECT
+       COALESCE(AVG(rating), 0) AS avg_rating,
+       COUNT(*) AS review_count
+     FROM reviews WHERE shipper_id = $1 AND review_type = 'carrier_to_shipper'`,
+    [shipperId]
+  );
+  const deliveredCount = await query(
+    `SELECT COUNT(*) AS delivered_count FROM loads WHERE shipper_id = $1 AND status = 'delivered'`,
+    [shipperId]
+  );
+  res.json({
+    avg_rating: parseFloat(result.rows[0].avg_rating).toFixed(1),
+    review_count: parseInt(result.rows[0].review_count, 10),
+    delivered_count: parseInt(deliveredCount.rows[0].delivered_count, 10),
+  });
+});
+
+// Ranking publico de los mejores carriers y shippers (por calificacion promedio)
+app.get('/api/rankings', async (req, res) => {
+  const role = req.query.role === 'shipper' ? 'shipper' : 'carrier';
+
+  if (role === 'carrier') {
+    const result = await query(
+      `SELECT
+         users.id, users.company_name, users.email,
+         COALESCE(AVG(reviews.rating), 0)::numeric(3,1) AS avg_rating,
+         COUNT(reviews.id) AS review_count
+       FROM users
+       JOIN reviews ON reviews.carrier_id = users.id AND reviews.review_type = 'shipper_to_carrier'
+       WHERE users.role = 'carrier'
+       GROUP BY users.id
+       HAVING COUNT(reviews.id) >= 1
+       ORDER BY avg_rating DESC, review_count DESC
+       LIMIT 10`
+    );
+    return res.json({ rankings: result.rows });
+  }
+
+  const result = await query(
+    `SELECT
+       users.id, users.company_name, users.email,
+       COALESCE(AVG(reviews.rating), 0)::numeric(3,1) AS avg_rating,
+       COUNT(reviews.id) AS review_count
+     FROM users
+     JOIN reviews ON reviews.shipper_id = users.id AND reviews.review_type = 'carrier_to_shipper'
+     WHERE users.role = 'shipper'
+     GROUP BY users.id
+     HAVING COUNT(reviews.id) >= 1
+     ORDER BY avg_rating DESC, review_count DESC
+     LIMIT 10`
+  );
+  res.json({ rankings: result.rows });
 });
 
 // Reservar una carga (solo carriers)
