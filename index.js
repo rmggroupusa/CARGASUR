@@ -180,7 +180,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
             ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-            subscription_status, subscription_plan
+            subscription_status, subscription_plan, profile_photo_url
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -213,7 +213,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan`,
+                 subscription_status, subscription_plan, profile_photo_url`,
       [
         company_name || null, phone || null, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
@@ -226,6 +226,66 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'No se pudo actualizar el perfil.' });
+  }
+});
+
+// Subir/actualizar la foto de perfil. Recibe una imagen en base64 (data URL),
+// la sube al bucket "avatars" de Supabase Storage, y guarda la URL publica en el usuario.
+app.put('/api/account/photo', requireAuth, async (req, res) => {
+  const { image } = req.body;
+  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'Imagen invalida.' });
+  }
+
+  const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+  }
+  const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+  const base64Data = match[2];
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  // Limite de 3MB para evitar subidas gigantes
+  if (buffer.length > 3 * 1024 * 1024) {
+    return res.status(400).json({ error: 'La imagen no puede pesar mas de 3MB.' });
+  }
+
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(500).json({ error: 'Almacenamiento de imagenes no configurado en el servidor.' });
+  }
+
+  try {
+    const fileName = `user-${req.user.id}-${Date.now()}.${ext}`;
+    const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/avatars/${fileName}`;
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': `image/${ext}`,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('Supabase storage upload error:', errText);
+      return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+    }
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/avatars/${fileName}`;
+
+    const result = await query(
+      'UPDATE users SET profile_photo_url = $1 WHERE id = $2 RETURNING profile_photo_url',
+      [publicUrl, req.user.id]
+    );
+
+    res.json({ profile_photo_url: result.rows[0].profile_photo_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo subir la imagen.' });
   }
 });
 
@@ -385,6 +445,7 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.license_number AS carrier_license_number,
        carrier.license_state AS carrier_license_state,
        carrier.attestation_signed AS carrier_attestation_signed,
+       carrier.profile_photo_url AS carrier_photo_url,
        rating_summary.avg_rating AS carrier_avg_rating,
        rating_summary.review_count AS carrier_review_count,
        my_review.rating AS my_review_rating
@@ -415,6 +476,7 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
        shipper.email AS shipper_email,
        shipper.phone AS shipper_phone,
        shipper.business_address AS shipper_business_address,
+       shipper.profile_photo_url AS shipper_photo_url,
        shipper_rating_summary.avg_rating AS shipper_avg_rating,
        shipper_rating_summary.review_count AS shipper_review_count,
        my_review.rating AS my_review_of_shipper_rating
