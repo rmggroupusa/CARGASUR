@@ -539,6 +539,39 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
   res.json({ loads });
 });
 
+// Cancelar la asignacion de una carga ya reservada (solo el shipper dueno, ej. si al verificar el FMCSA no le da confianza el carrier).
+// La carga regresa al tablero como disponible para que otro carrier la reserve.
+app.post('/api/loads/:id/cancel-booking', requireAuth, requireRole('shipper'), async (req, res) => {
+  const loadId = req.params.id;
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.shipper_id !== req.user.id) {
+    return res.status(403).json({ error: 'No puedes cancelar una carga que no es tuya.' });
+  }
+  if (load.status !== 'booked') {
+    return res.status(409).json({ error: 'Solo puedes cancelar la asignacion de cargas que esten reservadas (sin entregar todavia).' });
+  }
+
+  const booking = (await query(
+    `SELECT * FROM bookings WHERE load_id = $1 AND payment_status = 'paid' ORDER BY created_at DESC LIMIT 1`,
+    [loadId]
+  )).rows[0];
+
+  await query('UPDATE loads SET status = $1 WHERE id = $2', ['open', loadId]);
+  if (booking) {
+    await query('UPDATE bookings SET payment_status = $1 WHERE id = $2', ['cancelled', booking.id]);
+    createNotification(booking.carrier_id, loadId, 'booking_cancelled').catch((err) => console.error(err));
+  }
+
+  const wasPerLoad = booking && booking.payment_type === 'per_load';
+  res.json({
+    ok: true,
+    message: wasPerLoad
+      ? 'Asignacion cancelada. La carga volvio a estar disponible. Nota: el carrier ya habia pagado por esta carga (per-load); si corresponde un reembolso, procesalo manualmente desde tu Stripe Dashboard.'
+      : 'Asignacion cancelada. La carga volvio a estar disponible.',
+  });
+});
+
 // Marcar una carga como entregada (solo el carrier que la reservo)
 app.post('/api/loads/:id/deliver', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
