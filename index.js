@@ -371,34 +371,73 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 // Publicar una carga nueva (solo shippers con membresia activa)
 app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => {
-  const me = (await query('SELECT subscription_status FROM users WHERE id = $1', [req.user.id])).rows[0];
-  if (me.subscription_status !== 'active') {
-    return res.status(402).json({ error: 'Necesitas una membresia de Shipper activa para publicar cargas.' });
-  }
+  const me = (await query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
 
   const {
     origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
     weight, weight_unit, notes, origin_address, destination_address,
-    origin_lat, origin_lng, destination_lat, destination_lng,
+    origin_lat, origin_lng, destination_lat, destination_lng, wants_insurance,
+    length_feet, length_inches,
   } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
   }
 
+  // Codigo de 6 digitos que el shipper debe entregar a la persona que recibe la carga en destino.
+  // El carrier necesita este codigo para poder marcar la carga como entregada.
+  const deliveryCode = String(Math.floor(100000 + Math.random() * 900000));
+
+  const hasMembership = me.subscription_status === 'active';
+  const initialStatus = hasMembership ? 'open' : 'pending_payment';
+
   const result = await query(
     `INSERT INTO loads (
        shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
        weight, weight_unit, notes, origin_address, destination_address,
-       origin_lat, origin_lng, destination_lat, destination_lng
+       origin_lat, origin_lng, destination_lat, destination_lng, delivery_code, status, wants_insurance,
+       length_feet, length_inches
      )
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
     [
       req.user.id, origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null,
       weight || null, weight_unit || 'lb', notes || null, origin_address || null, destination_address || null,
-      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null,
+      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null, deliveryCode, initialStatus, !!wants_insurance,
+      length_feet || null, length_inches || null,
     ]
   );
-  res.json({ load: result.rows[0] });
+  const load = result.rows[0];
+
+  if (hasMembership) {
+    return res.json({ load });
+  }
+
+  // Sin membresia: cobrar una tarifa unica de publicacion (para shippers ocasionales, ej. una sola mudanza o entrega personal).
+  try {
+    const postFee = Number(process.env.SHIPPER_PER_LOAD_POST_PRICE_USD || 9.99);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      customer_email: me.email,
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: `Publicacion de carga #${load.id} (${load.origin} -> ${load.destination})`,
+            },
+            unit_amount: Math.round(postFee * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.FRONTEND_URL}/?posted=success&load=${load.id}`,
+      cancel_url: `${process.env.FRONTEND_URL}/?posted=cancelled&load=${load.id}`,
+      metadata: { load_id: String(load.id), kind: 'shipper_post_fee' },
+    });
+    res.json({ load, checkout_url: session.url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo iniciar el cobro de publicacion.' });
+  }
 });
 
 // Ver cargas disponibles (publico - cualquiera puede ver el tablero)
@@ -422,7 +461,9 @@ app.get('/api/loads', async (req, res) => {
   sql += ' ORDER BY loads.created_at DESC';
 
   const result = await query(sql, params);
-  res.json({ loads: result.rows });
+  // El codigo de entrega es privado: solo el shipper que publico la carga debe verlo.
+  const loads = result.rows.map(({ delivery_code, ...rest }) => rest);
+  res.json({ loads });
 });
 
 // Ver las cargas propias de un shipper, con los datos del carrier asignado (si ya fue reservada)
@@ -492,12 +533,16 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
      ORDER BY bookings.created_at DESC`,
     [req.user.id]
   );
-  res.json({ loads: result.rows });
+  // El codigo de entrega es privado: el carrier no debe verlo en la respuesta,
+  // debe pedirselo directamente a la persona que recibe la carga.
+  const loads = result.rows.map(({ delivery_code, ...rest }) => rest);
+  res.json({ loads });
 });
 
 // Marcar una carga como entregada (solo el carrier que la reservo)
 app.post('/api/loads/:id/deliver', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
+  const { delivery_code } = req.body;
   const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
   if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
   if (load.status !== 'booked') {
@@ -510,6 +555,12 @@ app.post('/api/loads/:id/deliver', requireAuth, requireRole('carrier'), async (r
   )).rows[0];
   if (!booking) {
     return res.status(403).json({ error: 'Esta carga no esta asignada a ti.' });
+  }
+
+  if (load.delivery_code) {
+    if (!delivery_code || String(delivery_code).trim() !== String(load.delivery_code).trim()) {
+      return res.status(400).json({ error: 'Codigo de entrega incorrecto. Pidele el codigo a la persona que recibio la carga.' });
+    }
   }
 
   await query('UPDATE loads SET status = $1 WHERE id = $2', ['delivered', loadId]);
@@ -684,7 +735,8 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
   const {
     origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
     weight, weight_unit, notes, origin_address, destination_address,
-    origin_lat, origin_lng, destination_lat, destination_lng,
+    origin_lat, origin_lng, destination_lat, destination_lng, wants_insurance,
+    length_feet, length_inches,
   } = req.body;
   if (!origin || !destination || !equipment_type || !rate) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
@@ -693,12 +745,14 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
   const result = await query(
     `UPDATE loads SET origin=$1, destination=$2, equipment_type=$3, rate=$4, miles=$5, pickup_date=$6, delivery_date=$7, payment_terms=$8,
             weight=$9, weight_unit=$10, notes=$11, origin_address=$12, destination_address=$13,
-            origin_lat=$14, origin_lng=$15, destination_lat=$16, destination_lng=$17
-     WHERE id=$18 RETURNING *`,
+            origin_lat=$14, origin_lng=$15, destination_lat=$16, destination_lng=$17, wants_insurance=$18,
+            length_feet=$19, length_inches=$20
+     WHERE id=$21 RETURNING *`,
     [
       origin, destination, equipment_type, rate, miles || null, pickup_date || null, delivery_date || null, payment_terms || null,
       weight || null, weight_unit || 'lb', notes || null, origin_address || null, destination_address || null,
-      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null, loadId,
+      origin_lat || null, origin_lng || null, destination_lat || null, destination_lng || null, !!wants_insurance,
+      length_feet || null, length_inches || null, loadId,
     ]
   );
   res.json({ load: result.rows[0] });
@@ -936,7 +990,17 @@ async function handleCheckoutCompleted(session) {
       );
     }
   } else if (session.mode === 'payment') {
+    const kind = session.metadata && session.metadata.kind;
     const loadId = session.metadata && session.metadata.load_id;
+
+    if (kind === 'shipper_post_fee') {
+      // El shipper pago la tarifa de publicacion unica: la carga pasa de "pending_payment" a "open" (visible en el tablero).
+      if (loadId) {
+        await query(`UPDATE loads SET status = 'open' WHERE id = $1 AND status = 'pending_payment'`, [loadId]);
+      }
+      return;
+    }
+
     const carrierId = session.metadata && session.metadata.carrier_id;
     if (loadId) {
       await query('UPDATE bookings SET payment_status = $1 WHERE stripe_checkout_session_id = $2', ['paid', session.id]);
