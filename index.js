@@ -771,8 +771,8 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
           quantity: 1,
         },
       ],
-      success_url: `${process.env.FRONTEND_URL}/loads?booked=success&load=${load.id}`,
-      cancel_url: `${process.env.FRONTEND_URL}/loads?booked=cancelled`,
+      success_url: `${process.env.FRONTEND_URL}/?booked=success&load=${load.id}`,
+      cancel_url: `${process.env.FRONTEND_URL}/?booked=cancelled`,
       metadata: { load_id: String(load.id), carrier_id: String(req.user.id), kind: 'per_load' },
     });
 
@@ -818,8 +818,8 @@ app.post('/api/billing/subscribe', requireAuth, async (req, res) => {
     mode: 'subscription',
     customer: customerId,
     line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${process.env.FRONTEND_URL}/billing?status=success`,
-    cancel_url: `${process.env.FRONTEND_URL}/billing?status=cancelled`,
+    success_url: `${process.env.FRONTEND_URL}/?status=success`,
+    cancel_url: `${process.env.FRONTEND_URL}/?status=cancelled`,
     metadata: { user_id: String(user.id), plan },
   });
 
@@ -834,7 +834,7 @@ app.post('/api/billing/portal', requireAuth, async (req, res) => {
   }
   const portalSession = await stripe.billingPortal.sessions.create({
     customer: user.stripe_customer_id,
-    return_url: `${process.env.FRONTEND_URL}/account`,
+    return_url: `${process.env.FRONTEND_URL}/?section=account`,
   });
   res.json({ url: portalSession.url });
 });
