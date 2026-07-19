@@ -807,6 +807,10 @@ app.post('/api/billing/subscribe', requireAuth, async (req, res) => {
 
   const user = (await query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
 
+  if (user.subscription_status === 'active') {
+    return res.status(400).json({ error: 'Ya tienes una membresia activa. Usa "Manage my membership" para administrarla o cambiarla.' });
+  }
+
   let customerId = user.stripe_customer_id;
   if (!customerId) {
     const customer = await stripe.customers.create({ email: user.email });
