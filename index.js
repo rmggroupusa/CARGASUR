@@ -33,6 +33,23 @@ async function geocodeAddress(address){
   }
 }
 
+// Millas reales de manejo (por carretera) entre dos coordenadas, usando Mapbox Directions.
+// Se usa en la carga masiva por CSV cuando el shipper no especifico las millas manualmente.
+async function getDrivingMiles(originCoord, destCoord){
+  if (!originCoord || !destCoord) return null;
+  try {
+    const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${originCoord.lng},${originCoord.lat};${destCoord.lng},${destCoord.lat}?access_token=${MAPBOX_TOKEN}&overview=false`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.routes || !data.routes[0]) return null;
+    return data.routes[0].distance / 1609.34; // metros a millas
+  } catch (err) {
+    console.error('Error calculando millas reales:', err);
+    return null;
+  }
+}
+
 async function sendEmail(to, subject, html) {
   if (!process.env.RESEND_API_KEY) {
     console.warn('RESEND_API_KEY no configurada: no se pudo enviar el correo a', to);
@@ -579,14 +596,15 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
 
   const created = [];
   const errors = [];
+  const warnings = [];
 
   for (let i = 0; i < loads.length; i++) {
     const row = loads[i] || {};
     const rowNum = i + 2; // +2 porque la fila 1 del CSV es el encabezado, y los humanos cuentan desde 1
-    const { origin, destination, equipment_type, rate } = row;
+    const { origin, destination, equipment_type, rate, origin_address, destination_address } = row;
 
-    if (!origin || !destination || !equipment_type || !rate) {
-      errors.push({ row: rowNum, message: 'Faltan campos obligatorios (origin, destination, equipment_type, rate).' });
+    if (!origin || !destination || !equipment_type || !rate || !origin_address || !destination_address) {
+      errors.push({ row: rowNum, message: 'Faltan campos obligatorios (origin, destination, equipment_type, rate, origin_address, destination_address).' });
       continue;
     }
     if (isNaN(Number(rate)) || Number(rate) <= 0) {
@@ -598,6 +616,26 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
       const deliveryCode = String(Math.floor(100000 + Math.random() * 900000));
       const originCoord = await geocodeAddress(row.origin_address);
       const destCoord = await geocodeAddress(row.destination_address);
+
+      // Si el mapa no pudo encontrar alguna direccion, la carga se crea igual (no se bloquea),
+      // pero se le avisa al shipper para que revise y corrija esa direccion si quiere que
+      // aparezca bien ubicada en el mapa y que las millas se calculen automaticamente.
+      if (!originCoord) {
+        warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de recogida ("${row.origin_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
+      }
+      if (!destCoord) {
+        warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de entrega ("${row.destination_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
+      }
+
+      // Si el shipper no puso millas manualmente, pero si dio ambas direcciones, calculamos
+      // las millas reales de manejo automaticamente (igual que al publicar una carga manual).
+      let miles = row.miles || null;
+      if (!miles && originCoord && destCoord) {
+        const calculated = await getDrivingMiles(originCoord, destCoord);
+        if (calculated !== null) miles = Math.round(calculated);
+        else warnings.push({ row: rowNum, message: 'No se pudieron calcular las millas de manejo automaticamente. Puedes agregarlas manualmente despues.' });
+      }
+
       await query(
         `INSERT INTO loads (
            shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
@@ -607,7 +645,7 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open',$14,$15,$16,$17,$18,$19,$20,$21)`,
         [
           req.user.id, origin, destination, equipment_type, Number(rate),
-          row.miles || null, row.pickup_date || null, row.delivery_date || null, row.payment_terms || null,
+          miles, row.pickup_date || null, row.delivery_date || null, row.payment_terms || null,
           row.weight || null, row.weight_unit || 'lb', row.notes || null, deliveryCode,
           row.length_feet || null, row.length_inches || null,
           row.origin_address || null, row.destination_address || null,
@@ -622,7 +660,7 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
     }
   }
 
-  res.json({ ok: true, createdCount: created.length, errors });
+  res.json({ ok: true, createdCount: created.length, errors, warnings });
 });
 
 // Ver cargas disponibles (publico - cualquiera puede ver el tablero)
