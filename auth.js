@@ -11,9 +11,9 @@ async function comparePassword(password, hash) {
   return bcrypt.compare(password, hash);
 }
 
-function signToken(user) {
+function signToken(user, sessionId) {
   return jwt.sign(
-    { id: user.id, role: user.role, email: user.email },
+    { id: user.id, role: user.role, email: user.email, sid: sessionId },
     JWT_SECRET,
     { expiresIn: '30d' }
   );
