@@ -1788,6 +1788,87 @@ app.post('/api/admin/carriers/:id/reject-license', requireAuth, requireAdmin, as
   res.json({ ok: true, message: 'Licencia rechazada. Se le pidio al carrier que la vuelva a subir.' });
 });
 
+// ============================================================
+// LISTA DE ESPERA (WAITLIST)
+// ============================================================
+
+// Publico: guarda un registro nuevo de la lista de espera (llamado desde el formulario del landing).
+app.post('/api/waitlist', async (req, res) => {
+  const { name, company, email, phone, city, role_type } = req.body;
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'Falta el correo electronico.' });
+  }
+  try {
+    await query(
+      `INSERT INTO waitlist (name, company, email, phone, city, role_type) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [name || null, company || null, email.trim(), phone || null, city || null, role_type || null]
+    );
+
+    // Avisar al admin de inmediato de este registro nuevo (ademas de lo que ya llega por Formspree).
+    const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim()).filter(Boolean);
+    for (const adminEmail of adminEmails) {
+      sendEmail(
+        adminEmail,
+        'New waitlist signup / Nuevo registro en lista de espera',
+        `<p>New waitlist signup:</p>
+         <ul>
+           <li><strong>Name:</strong> ${escapeHtmlServer(name || 'N/A')}</li>
+           <li><strong>Company:</strong> ${escapeHtmlServer(company || 'N/A')}</li>
+           <li><strong>Email:</strong> ${escapeHtmlServer(email)}</li>
+           <li><strong>Phone:</strong> ${escapeHtmlServer(phone || 'N/A')}</li>
+           <li><strong>City:</strong> ${escapeHtmlServer(city || 'N/A')}</li>
+           <li><strong>Type:</strong> ${escapeHtmlServer(role_type || 'N/A')}</li>
+         </ul>`
+      ).catch((err) => console.error('No se pudo notificar nuevo registro de waitlist:', err));
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo guardar el registro.' });
+  }
+});
+
+// Admin: lista todos los registros de la lista de espera.
+app.get('/api/admin/waitlist', requireAuth, requireAdmin, async (req, res) => {
+  const result = await query('SELECT * FROM waitlist ORDER BY created_at DESC');
+  res.json({ entries: result.rows });
+});
+
+// Admin: manda el correo de "ya lanzamos" a todos los registros que aun no han sido notificados.
+app.post('/api/admin/waitlist/send-launch-announcement', requireAuth, requireAdmin, async (req, res) => {
+  const result = await query('SELECT * FROM waitlist WHERE notified_at IS NULL');
+  const entries = result.rows;
+  if (entries.length === 0) {
+    return res.json({ ok: true, sentCount: 0, message: 'No hay registros pendientes de avisar.' });
+  }
+
+  let sentCount = 0;
+  for (const entry of entries) {
+    try {
+      await sendEmail(
+        entry.email,
+        "CargaSur is live! / ¡CargaSur ya está en vivo!",
+        `<p>Hi${entry.name ? ' ' + escapeHtmlServer(entry.name) : ''},</p>
+         <p>Great news — CargaSur is now live! You can create your account and start posting or booking loads today.</p>
+         <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>
+         <p>Thanks for joining our waitlist — we're excited to have you as one of our first users.</p>
+         <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+         <p>Hola${entry.name ? ' ' + escapeHtmlServer(entry.name) : ''},</p>
+         <p>¡Buenas noticias — CargaSur ya está en vivo! Ya puedes crear tu cuenta y empezar a publicar o reservar cargas hoy mismo.</p>
+         <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>
+         <p>Gracias por unirte a nuestra lista de espera — estamos emocionados de tenerte como uno de nuestros primeros usuarios.</p>`
+      );
+      await query('UPDATE waitlist SET notified_at = now() WHERE id = $1', [entry.id]);
+      sentCount++;
+    } catch (err) {
+      console.error('No se pudo enviar el anuncio de lanzamiento a ' + entry.email + ':', err);
+    }
+  }
+
+  res.json({ ok: true, sentCount, message: `Se envio el anuncio de lanzamiento a ${sentCount} de ${entries.length} personas.` });
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
 
 const port = process.env.PORT || 4000;
