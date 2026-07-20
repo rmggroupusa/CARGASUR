@@ -40,4 +40,14 @@ function requireRole(role) {
   };
 }
 
-module.exports = { requireAuth, requireRole };
+// Solo deja pasar si el correo de la sesion esta en la lista de administradores
+// (variable de entorno ADMIN_EMAILS, separada por comas).
+function requireAdmin(req, res, next) {
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  if (!req.user || !adminEmails.includes((req.user.email || '').toLowerCase())) {
+    return res.status(403).json({ error: 'No tienes permiso de administrador para esta accion.' });
+  }
+  next();
+}
+
+module.exports = { requireAuth, requireRole, requireAdmin };
