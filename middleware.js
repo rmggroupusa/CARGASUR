@@ -1,17 +1,34 @@
 const { verifyToken } = require('./auth');
+const { query } = require('./db');
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) {
     return res.status(401).json({ error: 'No autorizado. Falta el token de acceso.' });
   }
+  let decoded;
   try {
-    req.user = verifyToken(token);
-    next();
+    decoded = verifyToken(token);
   } catch (err) {
     return res.status(401).json({ error: 'Token invalido o vencido. Inicia sesion de nuevo.' });
   }
+
+  // Revisar que esta sesion siga siendo la activa (si alguien mas inicio sesion despues
+  // con el mismo correo y contrasena, esta sesion vieja queda invalidada automaticamente).
+  try {
+    const result = await query('SELECT active_session_id FROM users WHERE id = $1', [decoded.id]);
+    const dbUser = result.rows[0];
+    if (!dbUser || !decoded.sid || dbUser.active_session_id !== decoded.sid) {
+      return res.status(401).json({ error: 'Tu sesion se cerro porque se inicio sesion con esta cuenta desde otro dispositivo.', session_replaced: true });
+    }
+  } catch (err) {
+    console.error('Error verificando la sesion activa:', err);
+    return res.status(500).json({ error: 'No se pudo verificar la sesion.' });
+  }
+
+  req.user = decoded;
+  next();
 }
 
 function requireRole(role) {
