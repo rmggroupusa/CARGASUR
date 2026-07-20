@@ -121,7 +121,7 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
 });
 
 // A partir de aqui, todas las rutas reciben y devuelven JSON normal.
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // ============================================================
 // AUTENTICACION
