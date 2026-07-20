@@ -167,7 +167,9 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     const user = result.rows[0];
-    const token = signToken(user);
+    const sessionId = crypto.randomBytes(24).toString('hex');
+    await query('UPDATE users SET active_session_id = $1 WHERE id = $2', [sessionId, user.id]);
+    const token = signToken(user, sessionId);
 
     const roleLabel = role === 'shipper' ? 'Shipper' : 'Carrier';
     sendEmail(
@@ -219,7 +221,9 @@ app.post('/api/auth/login', async (req, res) => {
     if (user.deleted_at) {
       return res.status(403).json({ error: 'Esta cuenta esta desactivada.', can_reactivate: true });
     }
-    const token = signToken(user);
+    const sessionId = crypto.randomBytes(24).toString('hex');
+    await query('UPDATE users SET active_session_id = $1 WHERE id = $2', [sessionId, user.id]);
+    const token = signToken(user, sessionId);
     delete user.password_hash;
     res.json({ token, user });
   } catch (err) {
@@ -251,11 +255,13 @@ app.post('/api/auth/reactivate', async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url`,
       [user.id]
     );
     const reactivatedUser = result2.rows[0];
-    const token = signToken(reactivatedUser);
+    const sessionId = crypto.randomBytes(24).toString('hex');
+    await query('UPDATE users SET active_session_id = $1 WHERE id = $2', [sessionId, reactivatedUser.id]);
+    const token = signToken(reactivatedUser, sessionId);
     res.json({ token, user: reactivatedUser });
   } catch (err) {
     console.error(err);
@@ -268,7 +274,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
             ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-            subscription_status, subscription_plan, profile_photo_url, deleted_at
+            subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, deleted_at
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -305,7 +311,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url`,
       [
         company_name || null, phone || null, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
@@ -381,7 +387,125 @@ app.put('/api/account/photo', requireAuth, async (req, res) => {
   }
 });
 
-// Eliminar la cuenta propia. No se borra el historial de cargas/reservas/calificaciones
+// Subir el documento de seguro (insurance) del carrier. Se guarda en Supabase Storage,
+// bucket "documents" (separado de "avatars" ya que no es una foto de perfil).
+// Sin este documento, el carrier no puede reservar cargas (ver POST /api/loads/:id/book).
+app.put('/api/account/insurance-doc', requireAuth, requireRole('carrier'), async (req, res) => {
+  const { image } = req.body;
+  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'Imagen invalida.' });
+  }
+
+  const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+  }
+  const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+  const base64Data = match[2];
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  if (buffer.length > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+  }
+
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+  }
+
+  try {
+    const fileName = `insurance-${req.user.id}-${Date.now()}.${ext}`;
+    const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': `image/${ext}`,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('Supabase storage upload error (insurance):', errText);
+      return res.status(500).json({ error: 'No se pudo subir el documento.' });
+    }
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+
+    const result = await query(
+      'UPDATE users SET insurance_doc_url = $1 WHERE id = $2 RETURNING insurance_doc_url',
+      [publicUrl, req.user.id]
+    );
+
+    res.json({ insurance_doc_url: result.rows[0].insurance_doc_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo subir el documento.' });
+  }
+});
+
+// Subir el documento de registro del vehiculo (registration). Mismo patron que insurance-doc.
+app.put('/api/account/registration-doc', requireAuth, requireRole('carrier'), async (req, res) => {
+  const { image } = req.body;
+  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'Imagen invalida.' });
+  }
+
+  const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+  }
+  const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+  const base64Data = match[2];
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  if (buffer.length > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+  }
+
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+  }
+
+  try {
+    const fileName = `registration-${req.user.id}-${Date.now()}.${ext}`;
+    const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': `image/${ext}`,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('Supabase storage upload error (registration):', errText);
+      return res.status(500).json({ error: 'No se pudo subir el documento.' });
+    }
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+
+    const result = await query(
+      'UPDATE users SET registration_doc_url = $1 WHERE id = $2 RETURNING registration_doc_url',
+      [publicUrl, req.user.id]
+    );
+
+    res.json({ registration_doc_url: result.rows[0].registration_doc_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo subir el documento.' });
+  }
+});
+
+
 // (para no romper los registros de la otra parte), pero se anonimizan todos los datos
 // personales, se cancela cualquier membresia activa en Stripe, y se bloquea el login.
 app.delete('/api/account', requireAuth, async (req, res) => {
@@ -735,6 +859,8 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.license_state AS carrier_license_state,
        carrier.attestation_signed AS carrier_attestation_signed,
        carrier.profile_photo_url AS carrier_photo_url,
+       carrier.insurance_doc_url AS carrier_insurance_doc_url,
+       carrier.registration_doc_url AS carrier_registration_doc_url,
        rating_summary.avg_rating AS carrier_avg_rating,
        rating_summary.review_count AS carrier_review_count,
        my_review.rating AS my_review_rating
@@ -817,6 +943,58 @@ app.post('/api/loads/:id/cancel-booking', requireAuth, requireRole('shipper'), a
     message: wasPerLoad
       ? 'Asignacion cancelada. La carga volvio a estar disponible. Nota: el carrier ya habia pagado por esta carga (per-load); si corresponde un reembolso, procesalo manualmente desde tu Stripe Dashboard.'
       : 'Asignacion cancelada. La carga volvio a estar disponible.',
+  });
+});
+
+// Cancelar una carga ya reservada por el carrier (ej. no cabe en el vehiculo, percance en la via, etc.).
+// La carga regresa al tablero como disponible, y se le notifica al shipper con el motivo.
+app.post('/api/loads/:id/carrier-cancel', requireAuth, requireRole('carrier'), async (req, res) => {
+  const loadId = req.params.id;
+  const { reason, reason_detail } = req.body;
+
+  const validReasons = ['weight', 'size', 'road_incident', 'other'];
+  if (!reason || !validReasons.includes(reason)) {
+    return res.status(400).json({ error: 'Debes indicar un motivo valido de cancelacion.' });
+  }
+
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.status !== 'booked') {
+    return res.status(409).json({ error: 'Solo puedes cancelar cargas que esten reservadas (sin entregar todavia).' });
+  }
+
+  const booking = (await query(
+    `SELECT * FROM bookings WHERE load_id = $1 AND carrier_id = $2 AND payment_status = 'paid'`,
+    [loadId, req.user.id]
+  )).rows[0];
+  if (!booking) {
+    return res.status(403).json({ error: 'Esta carga no esta asignada a ti.' });
+  }
+
+  await query('UPDATE loads SET status = $1 WHERE id = $2', ['open', loadId]);
+  await query('UPDATE bookings SET payment_status = $1 WHERE id = $2', ['cancelled', booking.id]);
+
+  const reasonLabels = {
+    weight: 'el peso de la carga',
+    size: 'el tamano de la carga',
+    road_incident: 'un percance en la via',
+    other: 'otro motivo' + (reason_detail ? `: ${reason_detail}` : ''),
+  };
+  await query(
+    `INSERT INTO notifications (user_id, load_id, type, reason) VALUES ($1,$2,'carrier_cancelled_booking',$3)`,
+    [load.shipper_id, loadId, reasonLabels[reason]]
+  ).catch(async (err) => {
+    // Por si la columna "reason" todavia no existe en notifications (respaldo compatible hacia atras)
+    console.error('No se pudo guardar el motivo en la notificacion, se guarda sin motivo:', err.message);
+    await query(`INSERT INTO notifications (user_id, load_id, type) VALUES ($1,$2,'carrier_cancelled_booking')`, [load.shipper_id, loadId]);
+  });
+
+  const wasPerLoad = booking.payment_type === 'per_load';
+  res.json({
+    ok: true,
+    message: wasPerLoad
+      ? 'Cancelaste esta carga. Volvio a estar disponible en el tablero. Nota: ya habias pagado por esta carga (per-load); si corresponde un reembolso, contacta a soporte.'
+      : 'Cancelaste esta carga. Volvio a estar disponible en el tablero.',
   });
 });
 
@@ -1074,6 +1252,13 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
   if (load.status !== 'open') return res.status(409).json({ error: 'Esta carga ya no esta disponible.' });
 
   const carrier = (await query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
+
+  if (!carrier.insurance_doc_url) {
+    return res.status(403).json({ error: 'Necesitas subir tu documento de seguro (insurance) en "My Account" antes de poder reservar cargas.' });
+  }
+  if (!carrier.registration_doc_url) {
+    return res.status(403).json({ error: 'Necesitas subir el registro de tu vehiculo (registration) en "My Account" antes de poder reservar cargas.' });
+  }
 
   // Si tiene membresia mensual activa de carrier: reserva directa, sin cobro extra
   if (carrier.subscription_status === 'active' && carrier.subscription_plan === 'carrier_monthly') {
