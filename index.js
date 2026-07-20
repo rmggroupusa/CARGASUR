@@ -5,7 +5,7 @@ const Stripe = require('stripe');
 
 const { query } = require('./db');
 const { hashPassword, comparePassword, signToken } = require('./auth');
-const { requireAuth, requireRole } = require('./middleware');
+const { requireAuth, requireRole, requireAdmin } = require('./middleware');
 
 const crypto = require('crypto');
 
@@ -255,7 +255,7 @@ app.post('/api/auth/reactivate', async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved`,
       [user.id]
     );
     const reactivatedUser = result2.rows[0];
@@ -274,7 +274,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
             ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-            subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, deleted_at
+            subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved, deleted_at
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -311,7 +311,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved`,
       [
         company_name || null, phone || null, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
@@ -436,7 +436,7 @@ app.put('/api/account/insurance-doc', requireAuth, requireRole('carrier'), async
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
 
     const result = await query(
-      'UPDATE users SET insurance_doc_url = $1 WHERE id = $2 RETURNING insurance_doc_url',
+      'UPDATE users SET insurance_doc_url = $1, documents_approved = false WHERE id = $2 RETURNING insurance_doc_url',
       [publicUrl, req.user.id]
     );
 
@@ -494,7 +494,7 @@ app.put('/api/account/registration-doc', requireAuth, requireRole('carrier'), as
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
 
     const result = await query(
-      'UPDATE users SET registration_doc_url = $1 WHERE id = $2 RETURNING registration_doc_url',
+      'UPDATE users SET registration_doc_url = $1, documents_approved = false WHERE id = $2 RETURNING registration_doc_url',
       [publicUrl, req.user.id]
     );
 
@@ -861,6 +861,7 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.profile_photo_url AS carrier_photo_url,
        carrier.insurance_doc_url AS carrier_insurance_doc_url,
        carrier.registration_doc_url AS carrier_registration_doc_url,
+       carrier.documents_approved AS carrier_documents_approved,
        rating_summary.avg_rating AS carrier_avg_rating,
        rating_summary.review_count AS carrier_review_count,
        my_review.rating AS my_review_rating
@@ -1259,6 +1260,9 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
   if (!carrier.registration_doc_url) {
     return res.status(403).json({ error: 'Necesitas subir el registro de tu vehiculo (registration) en "My Account" antes de poder reservar cargas.' });
   }
+  if (!carrier.documents_approved) {
+    return res.status(403).json({ error: 'Tus documentos todavia estan pendientes de revision por un administrador. Te avisaremos cuando esten aprobados.' });
+  }
 
   // Si tiene membresia mensual activa de carrier: reserva directa, sin cobro extra
   if (carrier.subscription_status === 'active' && carrier.subscription_plan === 'carrier_monthly') {
@@ -1494,7 +1498,7 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
   const result = await query(
     `SELECT notifications.*, loads.origin, loads.destination
      FROM notifications
-     JOIN loads ON loads.id = notifications.load_id
+     LEFT JOIN loads ON loads.id = notifications.load_id
      WHERE notifications.user_id = $1
      ORDER BY notifications.created_at DESC
      LIMIT 30`,
@@ -1517,6 +1521,63 @@ app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// ============================================================
+// ADMINISTRACION (revision manual de documentos de carriers)
+// ============================================================
+
+// Lista los carriers que ya subieron ambos documentos pero aun no han sido aprobados.
+app.get('/api/admin/pending-carriers', requireAuth, requireAdmin, async (req, res) => {
+  const result = await query(
+    `SELECT id, email, company_name, phone, mc_number, vehicle_type, vehicle_make, vehicle_model,
+            vehicle_year, vehicle_plate, insurance_doc_url, registration_doc_url, created_at
+     FROM users
+     WHERE role = 'carrier' AND insurance_doc_url IS NOT NULL AND registration_doc_url IS NOT NULL
+           AND documents_approved = false AND deleted_at IS NULL
+     ORDER BY created_at ASC`
+  );
+  res.json({ carriers: result.rows });
+});
+
+// Aprobar los documentos de un carrier: ya puede reservar cargas.
+app.post('/api/admin/carriers/:id/approve-documents', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const result = await query(
+    `UPDATE users SET documents_approved = true WHERE id = $1 AND role = 'carrier' RETURNING id`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type) VALUES ($1, 'documents_approved')`,
+    [carrierId]
+  ).catch((err) => console.error('No se pudo notificar aprobacion de documentos:', err.message));
+
+  res.json({ ok: true, message: 'Documentos aprobados. El carrier ya puede reservar cargas.' });
+});
+
+// Rechazar los documentos de un carrier: se le pide volver a subirlos, con un motivo.
+app.post('/api/admin/carriers/:id/reject-documents', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'Debes indicar el motivo del rechazo.' });
+  }
+
+  const result = await query(
+    `UPDATE users SET insurance_doc_url = NULL, registration_doc_url = NULL, documents_approved = false
+     WHERE id = $1 AND role = 'carrier' RETURNING id`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type, reason) VALUES ($1, 'documents_rejected', $2)`,
+    [carrierId, reason.trim()]
+  ).catch((err) => console.error('No se pudo notificar rechazo de documentos:', err.message));
+
+  res.json({ ok: true, message: 'Documentos rechazados. Se le pidio al carrier que los vuelva a subir.' });
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
 
 const port = process.env.PORT || 4000;
