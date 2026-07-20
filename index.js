@@ -255,7 +255,7 @@ app.post('/api/auth/reactivate', async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, license_doc_url, insurance_approved, registration_approved, license_approved`,
       [user.id]
     );
     const reactivatedUser = result2.rows[0];
@@ -274,7 +274,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
             ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-            subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved, deleted_at
+            subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, license_doc_url, insurance_approved, registration_approved, license_approved, deleted_at
      FROM users WHERE id = $1`,
     [req.user.id]
   );
@@ -311,7 +311,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, documents_approved`,
+                 subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, license_doc_url, insurance_approved, registration_approved, license_approved`,
       [
         company_name || null, phone || null, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
@@ -436,7 +436,7 @@ app.put('/api/account/insurance-doc', requireAuth, requireRole('carrier'), async
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
 
     const result = await query(
-      'UPDATE users SET insurance_doc_url = $1, documents_approved = false WHERE id = $2 RETURNING insurance_doc_url',
+      'UPDATE users SET insurance_doc_url = $1, insurance_approved = false WHERE id = $2 RETURNING insurance_doc_url',
       [publicUrl, req.user.id]
     );
 
@@ -494,11 +494,69 @@ app.put('/api/account/registration-doc', requireAuth, requireRole('carrier'), as
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
 
     const result = await query(
-      'UPDATE users SET registration_doc_url = $1, documents_approved = false WHERE id = $2 RETURNING registration_doc_url',
+      'UPDATE users SET registration_doc_url = $1, registration_approved = false WHERE id = $2 RETURNING registration_doc_url',
       [publicUrl, req.user.id]
     );
 
     res.json({ registration_doc_url: result.rows[0].registration_doc_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo subir el documento.' });
+  }
+});
+
+// Subir el documento de licencia de conducir del carrier. Mismo patron que insurance-doc/registration-doc.
+app.put('/api/account/license-doc', requireAuth, requireRole('carrier'), async (req, res) => {
+  const { image } = req.body;
+  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'Imagen invalida.' });
+  }
+
+  const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+  }
+  const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+  const base64Data = match[2];
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  if (buffer.length > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+  }
+
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+  }
+
+  try {
+    const fileName = `license-${req.user.id}-${Date.now()}.${ext}`;
+    const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': `image/${ext}`,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('Supabase storage upload error (license):', errText);
+      return res.status(500).json({ error: 'No se pudo subir el documento.' });
+    }
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+
+    const result = await query(
+      'UPDATE users SET license_doc_url = $1, license_approved = false WHERE id = $2 RETURNING license_doc_url',
+      [publicUrl, req.user.id]
+    );
+
+    res.json({ license_doc_url: result.rows[0].license_doc_url });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'No se pudo subir el documento.' });
@@ -861,7 +919,10 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.profile_photo_url AS carrier_photo_url,
        carrier.insurance_doc_url AS carrier_insurance_doc_url,
        carrier.registration_doc_url AS carrier_registration_doc_url,
-       carrier.documents_approved AS carrier_documents_approved,
+       carrier.insurance_approved AS carrier_insurance_approved,
+       carrier.registration_approved AS carrier_registration_approved,
+       carrier.license_doc_url AS carrier_license_doc_url,
+       carrier.license_approved AS carrier_license_approved,
        rating_summary.avg_rating AS carrier_avg_rating,
        rating_summary.review_count AS carrier_review_count,
        my_review.rating AS my_review_rating
@@ -1260,7 +1321,10 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
   if (!carrier.registration_doc_url) {
     return res.status(403).json({ error: 'Necesitas subir el registro de tu vehiculo (registration) en "My Account" antes de poder reservar cargas.' });
   }
-  if (!carrier.documents_approved) {
+  if (!carrier.license_doc_url) {
+    return res.status(403).json({ error: 'Necesitas subir tu licencia de conducir en "My Account" antes de poder reservar cargas.' });
+  }
+  if (!carrier.insurance_approved || !carrier.registration_approved || !carrier.license_approved) {
     return res.status(403).json({ error: 'Tus documentos todavia estan pendientes de revision por un administrador. Te avisaremos cuando esten aprobados.' });
   }
 
@@ -1379,6 +1443,36 @@ function formatDateServer(d){
   if (!d) return 'N/A';
   const str = (d instanceof Date) ? d.toISOString() : String(d);
   return str.split('T')[0];
+}
+
+// Envia el correo de aprobacion o rechazo de un documento del carrier (seguro, registro, o licencia).
+// docLabelEn/docLabelEs son solo el nombre del documento en cada idioma, para reusar la misma plantilla.
+async function sendDocumentStatusEmail(email, docLabelEn, docLabelEs, approved, reason){
+  const subjectEn = approved ? `Your ${docLabelEn} was approved` : `Your ${docLabelEn} was rejected`;
+  const subjectEs = approved ? `Tu ${docLabelEs} fue aprobado` : `Tu ${docLabelEs} fue rechazado`;
+
+  const bodyEn = approved
+    ? `<p>Good news! Your <strong>${docLabelEn}</strong> was reviewed and approved.</p>
+       <p>Once all your required documents are approved, you'll be able to book loads on CargaSur.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>`
+    : `<p>Your <strong>${docLabelEn}</strong> was reviewed and could not be approved.</p>
+       <p><strong>Reason:</strong> ${escapeHtmlServer(reason || '')}</p>
+       <p>Please upload it again in "My Account" once you've corrected the issue.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>`;
+
+  const bodyEs = approved
+    ? `<p>¡Buenas noticias! Tu <strong>${docLabelEs}</strong> fue revisado y aprobado.</p>
+       <p>Una vez que todos tus documentos requeridos esten aprobados, podras reservar cargas en CargaSur.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>`
+    : `<p>Tu <strong>${docLabelEs}</strong> fue revisado y no pudo ser aprobado.</p>
+       <p><strong>Motivo:</strong> ${escapeHtmlServer(reason || '')}</p>
+       <p>Por favor subelo de nuevo en "My Account" una vez que corrijas el problema.</p>
+       <p><a href="https://app.cargasurfreight.com">https://app.cargasurfreight.com</a></p>`;
+
+  const subject = `${subjectEn} / ${subjectEs}`;
+  const html = bodyEn + '<hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">' + bodyEs;
+
+  return sendEmail(email, subject, html).catch((err) => console.error('No se pudo enviar el correo de estado de documento:', err));
 }
 
 async function sendLoadAssignedEmail(carrierId, loadId){
@@ -1521,42 +1615,47 @@ app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
 });
 
 // ============================================================
-// ============================================================
 // ADMINISTRACION (revision manual de documentos de carriers)
 // ============================================================
 
-// Lista los carriers que ya subieron ambos documentos pero aun no han sido aprobados.
+// Lista los carriers que tienen al menos un documento subido y pendiente de aprobar.
 app.get('/api/admin/pending-carriers', requireAuth, requireAdmin, async (req, res) => {
   const result = await query(
     `SELECT id, email, company_name, phone, mc_number, vehicle_type, vehicle_make, vehicle_model,
-            vehicle_year, vehicle_plate, insurance_doc_url, registration_doc_url, created_at
+            vehicle_year, vehicle_plate, insurance_doc_url, registration_doc_url, license_doc_url,
+            insurance_approved, registration_approved, license_approved, created_at
      FROM users
-     WHERE role = 'carrier' AND insurance_doc_url IS NOT NULL AND registration_doc_url IS NOT NULL
-           AND documents_approved = false AND deleted_at IS NULL
+     WHERE role = 'carrier' AND deleted_at IS NULL
+           AND (
+             (insurance_doc_url IS NOT NULL AND insurance_approved = false)
+             OR (registration_doc_url IS NOT NULL AND registration_approved = false)
+             OR (license_doc_url IS NOT NULL AND license_approved = false)
+           )
      ORDER BY created_at ASC`
   );
   res.json({ carriers: result.rows });
 });
 
-// Aprobar los documentos de un carrier: ya puede reservar cargas.
-app.post('/api/admin/carriers/:id/approve-documents', requireAuth, requireAdmin, async (req, res) => {
+// Aprobar el documento de seguro de un carrier.
+app.post('/api/admin/carriers/:id/approve-insurance', requireAuth, requireAdmin, async (req, res) => {
   const carrierId = req.params.id;
   const result = await query(
-    `UPDATE users SET documents_approved = true WHERE id = $1 AND role = 'carrier' RETURNING id`,
+    `UPDATE users SET insurance_approved = true WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
     [carrierId]
   );
   if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
 
   await query(
-    `INSERT INTO notifications (user_id, type) VALUES ($1, 'documents_approved')`,
+    `INSERT INTO notifications (user_id, type) VALUES ($1, 'insurance_approved')`,
     [carrierId]
-  ).catch((err) => console.error('No se pudo notificar aprobacion de documentos:', err.message));
+  ).catch((err) => console.error('No se pudo notificar aprobacion de seguro:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, 'proof of insurance', 'comprobante de seguro', true, null);
 
-  res.json({ ok: true, message: 'Documentos aprobados. El carrier ya puede reservar cargas.' });
+  res.json({ ok: true, message: 'Seguro aprobado.' });
 });
 
-// Rechazar los documentos de un carrier: se le pide volver a subirlos, con un motivo.
-app.post('/api/admin/carriers/:id/reject-documents', requireAuth, requireAdmin, async (req, res) => {
+// Rechazar el documento de seguro de un carrier: se le pide volver a subirlo, con un motivo.
+app.post('/api/admin/carriers/:id/reject-insurance', requireAuth, requireAdmin, async (req, res) => {
   const carrierId = req.params.id;
   const { reason } = req.body;
   if (!reason || !reason.trim()) {
@@ -1564,18 +1663,100 @@ app.post('/api/admin/carriers/:id/reject-documents', requireAuth, requireAdmin, 
   }
 
   const result = await query(
-    `UPDATE users SET insurance_doc_url = NULL, registration_doc_url = NULL, documents_approved = false
-     WHERE id = $1 AND role = 'carrier' RETURNING id`,
+    `UPDATE users SET insurance_doc_url = NULL, insurance_approved = false WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
     [carrierId]
   );
   if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
 
   await query(
-    `INSERT INTO notifications (user_id, type, reason) VALUES ($1, 'documents_rejected', $2)`,
+    `INSERT INTO notifications (user_id, type, reason) VALUES ($1, 'insurance_rejected', $2)`,
     [carrierId, reason.trim()]
-  ).catch((err) => console.error('No se pudo notificar rechazo de documentos:', err.message));
+  ).catch((err) => console.error('No se pudo notificar rechazo de seguro:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, 'proof of insurance', 'comprobante de seguro', false, reason.trim());
 
-  res.json({ ok: true, message: 'Documentos rechazados. Se le pidio al carrier que los vuelva a subir.' });
+  res.json({ ok: true, message: 'Seguro rechazado. Se le pidio al carrier que lo vuelva a subir.' });
+});
+
+// Aprobar el documento de registro del vehiculo de un carrier.
+app.post('/api/admin/carriers/:id/approve-registration', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const result = await query(
+    `UPDATE users SET registration_approved = true WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type) VALUES ($1, 'registration_approved')`,
+    [carrierId]
+  ).catch((err) => console.error('No se pudo notificar aprobacion de registro:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, 'vehicle registration', 'registro del vehículo', true, null);
+
+  res.json({ ok: true, message: 'Registro aprobado.' });
+});
+
+// Rechazar el documento de registro del vehiculo de un carrier: se le pide volver a subirlo, con un motivo.
+app.post('/api/admin/carriers/:id/reject-registration', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'Debes indicar el motivo del rechazo.' });
+  }
+
+  const result = await query(
+    `UPDATE users SET registration_doc_url = NULL, registration_approved = false WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type, reason) VALUES ($1, 'registration_rejected', $2)`,
+    [carrierId, reason.trim()]
+  ).catch((err) => console.error('No se pudo notificar rechazo de registro:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, 'vehicle registration', 'registro del vehículo', false, reason.trim());
+
+  res.json({ ok: true, message: 'Registro rechazado. Se le pidio al carrier que lo vuelva a subir.' });
+});
+
+// Aprobar la licencia de conducir de un carrier.
+app.post('/api/admin/carriers/:id/approve-license', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const result = await query(
+    `UPDATE users SET license_approved = true WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type) VALUES ($1, 'license_approved')`,
+    [carrierId]
+  ).catch((err) => console.error('No se pudo notificar aprobacion de licencia:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, "driver's license", 'licencia de conducir', true, null);
+
+  res.json({ ok: true, message: 'Licencia de conducir aprobada.' });
+});
+
+// Rechazar la licencia de conducir de un carrier: se le pide volver a subirla, con un motivo.
+app.post('/api/admin/carriers/:id/reject-license', requireAuth, requireAdmin, async (req, res) => {
+  const carrierId = req.params.id;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'Debes indicar el motivo del rechazo.' });
+  }
+
+  const result = await query(
+    `UPDATE users SET license_doc_url = NULL, license_approved = false WHERE id = $1 AND role = 'carrier' RETURNING id, email`,
+    [carrierId]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Carrier no encontrado.' });
+
+  await query(
+    `INSERT INTO notifications (user_id, type, reason) VALUES ($1, 'license_rejected', $2)`,
+    [carrierId, reason.trim()]
+  ).catch((err) => console.error('No se pudo notificar rechazo de licencia:', err.message));
+  sendDocumentStatusEmail(result.rows[0].email, "driver's license", 'licencia de conducir', false, reason.trim());
+
+  res.json({ ok: true, message: 'Licencia rechazada. Se le pidio al carrier que la vuelva a subir.' });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
