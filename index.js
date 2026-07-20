@@ -166,6 +166,9 @@ app.post('/api/auth/login', async (req, res) => {
     if (!valid) {
       return res.status(401).json({ error: 'Correo o contrasena incorrectos.' });
     }
+    if (user.deleted_at) {
+      return res.status(401).json({ error: 'Esta cuenta fue eliminada.' });
+    }
     const token = signToken(user);
     delete user.password_hash;
     res.json({ token, user });
@@ -180,11 +183,15 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
     `SELECT id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
             vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
             ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
-            subscription_status, subscription_plan, profile_photo_url
+            subscription_status, subscription_plan, profile_photo_url, deleted_at
      FROM users WHERE id = $1`,
     [req.user.id]
   );
-  res.json({ user: result.rows[0] });
+  const user = result.rows[0];
+  if (!user || user.deleted_at) {
+    return res.status(401).json({ error: 'Esta cuenta fue eliminada.' });
+  }
+  res.json({ user });
 });
 
 // Completar/actualizar el perfil despues del registro (vehiculo, licencia, EIN, direccion, etc.)
@@ -286,6 +293,69 @@ app.put('/api/account/photo', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'No se pudo subir la imagen.' });
+  }
+});
+
+// Eliminar la cuenta propia. No se borra el historial de cargas/reservas/calificaciones
+// (para no romper los registros de la otra parte), pero se anonimizan todos los datos
+// personales, se cancela cualquier membresia activa en Stripe, y se bloquea el login.
+app.delete('/api/account', requireAuth, async (req, res) => {
+  try {
+    const me = (await query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
+    if (!me) return res.status(404).json({ error: 'Usuario no encontrado.' });
+    if (me.deleted_at) return res.status(400).json({ error: 'Esta cuenta ya fue eliminada.' });
+
+    // No permitir eliminar la cuenta si hay una carga reservada (booked) sin resolver todavia,
+    // ya sea como shipper (dueno de la carga) o como carrier (quien la reservo).
+    const activeAsShipper = await query(
+      `SELECT id FROM loads WHERE shipper_id = $1 AND status = 'booked'`,
+      [req.user.id]
+    );
+    const activeAsCarrier = await query(
+      `SELECT loads.id FROM bookings
+       JOIN loads ON loads.id = bookings.load_id
+       WHERE bookings.carrier_id = $1 AND bookings.payment_status = 'paid' AND loads.status = 'booked'`,
+      [req.user.id]
+    );
+    if (activeAsShipper.rows.length || activeAsCarrier.rows.length) {
+      return res.status(409).json({
+        error: 'Tienes cargas reservadas sin entregar o cancelar todavia. Resuelve esas cargas antes de eliminar tu cuenta.',
+      });
+    }
+
+    // Cancelar cualquier membresia activa en Stripe, para no seguir cobrando a una cuenta eliminada.
+    if (me.stripe_customer_id) {
+      try {
+        const subs = await stripe.subscriptions.list({ customer: me.stripe_customer_id, status: 'active' });
+        for (const sub of subs.data) {
+          await stripe.subscriptions.cancel(sub.id);
+        }
+      } catch (stripeErr) {
+        console.error('No se pudo cancelar la suscripcion de Stripe al eliminar la cuenta:', stripeErr);
+      }
+    }
+
+    // Cancelar cualquier carga abierta (todavia no reservada) que quede huerfana al eliminar al shipper.
+    await query(`UPDATE loads SET status = 'cancelled' WHERE shipper_id = $1 AND status IN ('open','pending_payment')`, [req.user.id]);
+
+    // Anonimizar: se reemplazan todos los datos personales identificables por valores genericos.
+    // Un password aleatorio e imposible de adivinar bloquea el login por partida doble (ademas del check de deleted_at).
+    const unusablePasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
+    await query(
+      `UPDATE users SET
+         email = $1, password_hash = $2, company_name = 'Deleted user', phone = NULL, city = NULL, state = NULL,
+         mc_number = NULL, vehicle_type = NULL, vehicle_make = NULL, vehicle_model = NULL, vehicle_year = NULL,
+         vehicle_plate = NULL, license_number = NULL, license_state = NULL, ein_number = NULL, business_address = NULL,
+         profile_photo_url = NULL, stripe_customer_id = NULL, subscription_status = 'cancelled', subscription_plan = NULL,
+         reset_token = NULL, reset_token_expires = NULL, deleted_at = now()
+       WHERE id = $3`,
+      [`deleted-user-${req.user.id}@cargasurfreight.com`, unusablePasswordHash, req.user.id]
+    );
+
+    res.json({ ok: true, message: 'Tu cuenta fue eliminada. Tus datos personales fueron anonimizados.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo eliminar la cuenta.' });
   }
 });
 
