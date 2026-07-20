@@ -538,6 +538,64 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
   }
 });
 
+// Publicar varias cargas de una sola vez (ej. subiendo un CSV desde el frontend, ya convertido a JSON aqui).
+// Requiere membresia activa: cobrar la tarifa de $9.99 individualmente por cada carga de un lote grande
+// no es practico, asi que esta funcion es exclusiva para shippers con membresia mensual.
+app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res) => {
+  const me = (await query('SELECT subscription_status FROM users WHERE id = $1', [req.user.id])).rows[0];
+  if (me.subscription_status !== 'active') {
+    return res.status(402).json({ error: 'La publicacion en lote requiere una membresia de Shipper activa. Suscribete o publica las cargas una por una.' });
+  }
+
+  const { loads } = req.body;
+  if (!Array.isArray(loads) || loads.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron cargas para publicar.' });
+  }
+  if (loads.length > 200) {
+    return res.status(400).json({ error: 'Maximo 200 cargas por archivo. Divide tu CSV en partes mas pequenas.' });
+  }
+
+  const created = [];
+  const errors = [];
+
+  for (let i = 0; i < loads.length; i++) {
+    const row = loads[i] || {};
+    const rowNum = i + 2; // +2 porque la fila 1 del CSV es el encabezado, y los humanos cuentan desde 1
+    const { origin, destination, equipment_type, rate } = row;
+
+    if (!origin || !destination || !equipment_type || !rate) {
+      errors.push({ row: rowNum, message: 'Faltan campos obligatorios (origin, destination, equipment_type, rate).' });
+      continue;
+    }
+    if (isNaN(Number(rate)) || Number(rate) <= 0) {
+      errors.push({ row: rowNum, message: 'El rate debe ser un numero mayor a 0.' });
+      continue;
+    }
+
+    try {
+      const deliveryCode = String(Math.floor(100000 + Math.random() * 900000));
+      await query(
+        `INSERT INTO loads (
+           shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
+           weight, weight_unit, notes, delivery_code, status
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open')`,
+        [
+          req.user.id, origin, destination, equipment_type, Number(rate),
+          row.miles || null, row.pickup_date || null, row.delivery_date || null, row.payment_terms || null,
+          row.weight || null, row.weight_unit || 'lb', row.notes || null, deliveryCode,
+        ]
+      );
+      created.push(rowNum);
+    } catch (err) {
+      console.error('Error creando carga en lote, fila ' + rowNum + ':', err);
+      errors.push({ row: rowNum, message: 'Error al guardar esta fila.' });
+    }
+  }
+
+  res.json({ ok: true, createdCount: created.length, errors });
+});
+
 // Ver cargas disponibles (publico - cualquiera puede ver el tablero)
 app.get('/api/loads', async (req, res) => {
   const { state, equipment_type } = req.query;
