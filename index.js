@@ -11,6 +11,28 @@ const crypto = require('crypto');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
+// Mismo token publico que ya usa el frontend para el autocompletado de direcciones (los tokens
+// publicos de Mapbox estan disenados para ser visibles, no son un secreto).
+const MAPBOX_TOKEN = 'pk.eyJ1IjoiY2FyZ2FzdXIiLCJhIjoiY21ycjFzb2ZxMGpnbzR1b3d6OGhwcWR4aSJ9.OJxmvt7PyLrJbpdbb8gYqQ';
+
+// Convierte una direccion de texto en coordenadas (lat/lng), para que las cargas subidas por
+// CSV tambien aparezcan bien ubicadas en el mapa, igual que las publicadas manualmente.
+async function geocodeAddress(address){
+  if (!address) return null;
+  try {
+    const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${MAPBOX_TOKEN}&country=us&limit=1`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const feature = data.features && data.features[0];
+    if (!feature) return null;
+    return { lat: feature.center[1], lng: feature.center[0] };
+  } catch (err) {
+    console.error('Error geocodificando direccion:', err);
+    return null;
+  }
+}
+
 async function sendEmail(to, subject, html) {
   if (!process.env.RESEND_API_KEY) {
     console.warn('RESEND_API_KEY no configurada: no se pudo enviar el correo a', to);
@@ -574,16 +596,23 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
 
     try {
       const deliveryCode = String(Math.floor(100000 + Math.random() * 900000));
+      const originCoord = await geocodeAddress(row.origin_address);
+      const destCoord = await geocodeAddress(row.destination_address);
       await query(
         `INSERT INTO loads (
            shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
-           weight, weight_unit, notes, delivery_code, status
+           weight, weight_unit, notes, delivery_code, status, length_feet, length_inches,
+           origin_address, destination_address, origin_lat, origin_lng, destination_lat, destination_lng
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open')`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open',$14,$15,$16,$17,$18,$19,$20,$21)`,
         [
           req.user.id, origin, destination, equipment_type, Number(rate),
           row.miles || null, row.pickup_date || null, row.delivery_date || null, row.payment_terms || null,
           row.weight || null, row.weight_unit || 'lb', row.notes || null, deliveryCode,
+          row.length_feet || null, row.length_inches || null,
+          row.origin_address || null, row.destination_address || null,
+          originCoord ? originCoord.lat : null, originCoord ? originCoord.lng : null,
+          destCoord ? destCoord.lat : null, destCoord ? destCoord.lng : null,
         ]
       );
       created.push(rowNum);
