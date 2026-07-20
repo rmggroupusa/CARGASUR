@@ -26,10 +26,18 @@ async function geocodeAddress(address){
     const data = await res.json();
     const feature = data.features && data.features[0];
     if (!feature) return null;
-    // "relevance" (0 a 1) indica que tan segura esta Mapbox de la respuesta. Mapbox casi
-    // siempre devuelve "su mejor intento" en vez de admitir que no encontro nada, asi que
-    // usamos este puntaje para detectar direcciones inventadas o poco confiables.
-    return { lat: feature.center[1], lng: feature.center[0], relevance: typeof feature.relevance === 'number' ? feature.relevance : 1 };
+    // "relevance" (0 a 1) indica que tan segura esta Mapbox de la respuesta. "place_type"
+    // indica el nivel del resultado: "address" es una direccion exacta; si en cambio
+    // devuelve algo mas generico ("place" = ciudad, "region" = estado, etc.), significa que
+    // no encontro la calle/numero especifico, aunque no haya devuelto un error.
+    // Mapbox casi siempre devuelve "su mejor intento" en vez de admitir que no encontro nada,
+    // asi que usamos estas dos senales juntas para detectar direcciones inventadas o mal escritas.
+    return {
+      lat: feature.center[1],
+      lng: feature.center[0],
+      relevance: typeof feature.relevance === 'number' ? feature.relevance : 1,
+      isExactAddress: Array.isArray(feature.place_type) && feature.place_type.includes('address'),
+    };
   } catch (err) {
     console.error('Error geocodificando direccion:', err);
     return null;
@@ -620,19 +628,17 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
       const originCoord = await geocodeAddress(row.origin_address);
       const destCoord = await geocodeAddress(row.destination_address);
 
-      // Si el mapa no encontro nada, o encontro algo con muy poca confianza (probablemente
-      // una direccion mal escrita o inventada), la carga se crea igual (no se bloquea),
-      // pero se le avisa al shipper para que la revise.
+      // Si el mapa no encontro nada, o lo que encontro no es una direccion exacta (solo ciudad/estado),
+      // o tiene muy poca confianza, la carga se crea igual (no se bloquea), pero se le avisa
+      // al shipper para que la revise.
       const RELEVANCE_THRESHOLD = 0.5;
-      if (!originCoord) {
-        warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de recogida ("${row.origin_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
-      } else if (originCoord.relevance < RELEVANCE_THRESHOLD) {
-        warnings.push({ row: rowNum, message: `La direccion de recogida ("${row.origin_address}") no coincide con confianza en el mapa. Revisa que este bien escrita.` });
+      const originNotFound = !originCoord || !originCoord.isExactAddress || originCoord.relevance < RELEVANCE_THRESHOLD;
+      const destNotFound = !destCoord || !destCoord.isExactAddress || destCoord.relevance < RELEVANCE_THRESHOLD;
+      if (originNotFound) {
+        warnings.push({ row: rowNum, message: `No se pudo confirmar la direccion de recogida ("${row.origin_address}") como una direccion exacta en el mapa. La carga se creo, pero revisa esa direccion.` });
       }
-      if (!destCoord) {
-        warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de entrega ("${row.destination_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
-      } else if (destCoord.relevance < RELEVANCE_THRESHOLD) {
-        warnings.push({ row: rowNum, message: `La direccion de entrega ("${row.destination_address}") no coincide con confianza en el mapa. Revisa que este bien escrita.` });
+      if (destNotFound) {
+        warnings.push({ row: rowNum, message: `No se pudo confirmar la direccion de entrega ("${row.destination_address}") como una direccion exacta en el mapa. La carga se creo, pero revisa esa direccion.` });
       }
 
       // Si el shipper no puso millas manualmente, pero si dio ambas direcciones, calculamos
