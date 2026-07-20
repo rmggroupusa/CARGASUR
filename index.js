@@ -26,7 +26,10 @@ async function geocodeAddress(address){
     const data = await res.json();
     const feature = data.features && data.features[0];
     if (!feature) return null;
-    return { lat: feature.center[1], lng: feature.center[0] };
+    // "relevance" (0 a 1) indica que tan segura esta Mapbox de la respuesta. Mapbox casi
+    // siempre devuelve "su mejor intento" en vez de admitir que no encontro nada, asi que
+    // usamos este puntaje para detectar direcciones inventadas o poco confiables.
+    return { lat: feature.center[1], lng: feature.center[0], relevance: typeof feature.relevance === 'number' ? feature.relevance : 1 };
   } catch (err) {
     console.error('Error geocodificando direccion:', err);
     return null;
@@ -617,14 +620,19 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
       const originCoord = await geocodeAddress(row.origin_address);
       const destCoord = await geocodeAddress(row.destination_address);
 
-      // Si el mapa no pudo encontrar alguna direccion, la carga se crea igual (no se bloquea),
-      // pero se le avisa al shipper para que revise y corrija esa direccion si quiere que
-      // aparezca bien ubicada en el mapa y que las millas se calculen automaticamente.
+      // Si el mapa no encontro nada, o encontro algo con muy poca confianza (probablemente
+      // una direccion mal escrita o inventada), la carga se crea igual (no se bloquea),
+      // pero se le avisa al shipper para que la revise.
+      const RELEVANCE_THRESHOLD = 0.5;
       if (!originCoord) {
         warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de recogida ("${row.origin_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
+      } else if (originCoord.relevance < RELEVANCE_THRESHOLD) {
+        warnings.push({ row: rowNum, message: `La direccion de recogida ("${row.origin_address}") no coincide con confianza en el mapa. Revisa que este bien escrita.` });
       }
       if (!destCoord) {
         warnings.push({ row: rowNum, message: `No se pudo ubicar la direccion de entrega ("${row.destination_address}") en el mapa. La carga se creo, pero sin ubicacion exacta.` });
+      } else if (destCoord.relevance < RELEVANCE_THRESHOLD) {
+        warnings.push({ row: rowNum, message: `La direccion de entrega ("${row.destination_address}") no coincide con confianza en el mapa. Revisa que este bien escrita.` });
       }
 
       // Si el shipper no puso millas manualmente, pero si dio ambas direcciones, calculamos
