@@ -167,7 +167,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Correo o contrasena incorrectos.' });
     }
     if (user.deleted_at) {
-      return res.status(401).json({ error: 'Esta cuenta fue eliminada.' });
+      return res.status(403).json({ error: 'Esta cuenta esta desactivada.', can_reactivate: true });
     }
     const token = signToken(user);
     delete user.password_hash;
@@ -175,6 +175,41 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'No se pudo iniciar sesion.' });
+  }
+});
+
+// Reactivar una cuenta desactivada: requiere las mismas credenciales que un login normal.
+app.post('/api/auth/reactivate', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Faltan el correo o la contrasena.' });
+  }
+  try {
+    const result = await query('SELECT * FROM users WHERE email = $1', [email]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Correo o contrasena incorrectos.' });
+
+    const valid = await comparePassword(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Correo o contrasena incorrectos.' });
+
+    if (!user.deleted_at) {
+      return res.status(400).json({ error: 'Esta cuenta ya esta activa.' });
+    }
+
+    const result2 = await query(
+      `UPDATE users SET deleted_at = NULL WHERE id = $1
+       RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
+                 vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
+                 ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
+                 subscription_status, subscription_plan, profile_photo_url`,
+      [user.id]
+    );
+    const reactivatedUser = result2.rows[0];
+    const token = signToken(reactivatedUser);
+    res.json({ token, user: reactivatedUser });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo reactivar la cuenta.' });
   }
 });
 
@@ -338,21 +373,14 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     // Cancelar cualquier carga abierta (todavia no reservada) que quede huerfana al eliminar al shipper.
     await query(`UPDATE loads SET status = 'cancelled' WHERE shipper_id = $1 AND status IN ('open','pending_payment')`, [req.user.id]);
 
-    // Anonimizar: se reemplazan todos los datos personales identificables por valores genericos.
-    // Un password aleatorio e imposible de adivinar bloquea el login por partida doble (ademas del check de deleted_at).
-    const unusablePasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
+    // Desactivar la cuenta (no se borran ni anonimizan los datos todavia, para permitir reactivarla
+    // despues si esa persona decide regresar). El login queda bloqueado mientras este desactivada.
     await query(
-      `UPDATE users SET
-         email = $1, password_hash = $2, company_name = 'Deleted user', phone = NULL, city = NULL, state = NULL,
-         mc_number = NULL, vehicle_type = NULL, vehicle_make = NULL, vehicle_model = NULL, vehicle_year = NULL,
-         vehicle_plate = NULL, license_number = NULL, license_state = NULL, ein_number = NULL, business_address = NULL,
-         profile_photo_url = NULL, stripe_customer_id = NULL, subscription_status = 'cancelled', subscription_plan = NULL,
-         reset_token = NULL, reset_token_expires = NULL, deleted_at = now()
-       WHERE id = $3`,
-      [`deleted-user-${req.user.id}@cargasurfreight.com`, unusablePasswordHash, req.user.id]
+      `UPDATE users SET subscription_status = 'cancelled', subscription_plan = NULL, deleted_at = now() WHERE id = $1`,
+      [req.user.id]
     );
 
-    res.json({ ok: true, message: 'Tu cuenta fue eliminada. Tus datos personales fueron anonimizados.' });
+    res.json({ ok: true, message: 'Tu cuenta fue desactivada. Si cambias de opinion, puedes reactivarla iniciando sesion de nuevo con tu correo y contrasena.' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'No se pudo eliminar la cuenta.' });
