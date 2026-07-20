@@ -630,15 +630,17 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
 
       // Si el mapa no encontro nada, o lo que encontro no es una direccion exacta (solo ciudad/estado),
       // o tiene muy poca confianza, la carga se crea igual (no se bloquea), pero se le avisa
-      // al shipper para que la revise.
+      // al shipper para que la revise. Los mensajes se arman aqui y se completan con el ID
+      // real de la carga despues de crearla, para que sea facil de encontrar en "My Loads".
       const RELEVANCE_THRESHOLD = 0.5;
       const originNotFound = !originCoord || !originCoord.isExactAddress || originCoord.relevance < RELEVANCE_THRESHOLD;
       const destNotFound = !destCoord || !destCoord.isExactAddress || destCoord.relevance < RELEVANCE_THRESHOLD;
+      const rowWarnings = [];
       if (originNotFound) {
-        warnings.push({ row: rowNum, message: `No se pudo confirmar la direccion de recogida ("${row.origin_address}") como una direccion exacta en el mapa. La carga se creo, pero revisa esa direccion.` });
+        rowWarnings.push(`la direccion de recogida ("${row.origin_address}") no se pudo confirmar como una direccion exacta en el mapa`);
       }
       if (destNotFound) {
-        warnings.push({ row: rowNum, message: `No se pudo confirmar la direccion de entrega ("${row.destination_address}") como una direccion exacta en el mapa. La carga se creo, pero revisa esa direccion.` });
+        rowWarnings.push(`la direccion de entrega ("${row.destination_address}") no se pudo confirmar como una direccion exacta en el mapa`);
       }
 
       // Si el shipper no puso millas manualmente, pero si dio ambas direcciones, calculamos
@@ -647,16 +649,17 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
       if (!miles && originCoord && destCoord) {
         const calculated = await getDrivingMiles(originCoord, destCoord);
         if (calculated !== null) miles = Math.round(calculated);
-        else warnings.push({ row: rowNum, message: 'No se pudieron calcular las millas de manejo automaticamente. Puedes agregarlas manualmente despues.' });
+        else rowWarnings.push('no se pudieron calcular las millas de manejo automaticamente');
       }
 
-      await query(
+      const insertResult = await query(
         `INSERT INTO loads (
            shipper_id, origin, destination, equipment_type, rate, miles, pickup_date, delivery_date, payment_terms,
            weight, weight_unit, notes, delivery_code, status, length_feet, length_inches,
            origin_address, destination_address, origin_lat, origin_lng, destination_lat, destination_lng
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open',$14,$15,$16,$17,$18,$19,$20,$21)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open',$14,$15,$16,$17,$18,$19,$20,$21)
+         RETURNING id`,
         [
           req.user.id, origin, destination, equipment_type, Number(rate),
           miles, row.pickup_date || null, row.delivery_date || null, row.payment_terms || null,
@@ -667,7 +670,15 @@ app.post('/api/loads/bulk', requireAuth, requireRole('shipper'), async (req, res
           destCoord ? destCoord.lat : null, destCoord ? destCoord.lng : null,
         ]
       );
+      const newLoadId = insertResult.rows[0].id;
       created.push(rowNum);
+
+      if (rowWarnings.length) {
+        warnings.push({
+          row: rowNum,
+          message: `Carga #${newLoadId} (${origin} -> ${destination}): ${rowWarnings.join('; ')}.`,
+        });
+      }
     } catch (err) {
       console.error('Error creando carga en lote, fila ' + rowNum + ':', err);
       errors.push({ row: rowNum, message: 'Error al guardar esta fila.' });
