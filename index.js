@@ -440,6 +440,8 @@ app.put('/api/account/insurance-doc', requireAuth, requireRole('carrier'), async
       [publicUrl, req.user.id]
     );
 
+    notifyAdminNewDocument(req.user.email, null, 'proof of insurance', 'comprobante de seguro');
+
     res.json({ insurance_doc_url: result.rows[0].insurance_doc_url });
   } catch (err) {
     console.error(err);
@@ -498,6 +500,8 @@ app.put('/api/account/registration-doc', requireAuth, requireRole('carrier'), as
       [publicUrl, req.user.id]
     );
 
+    notifyAdminNewDocument(req.user.email, null, 'vehicle registration', 'registro del vehículo');
+
     res.json({ registration_doc_url: result.rows[0].registration_doc_url });
   } catch (err) {
     console.error(err);
@@ -555,6 +559,8 @@ app.put('/api/account/license-doc', requireAuth, requireRole('carrier'), async (
       'UPDATE users SET license_doc_url = $1, license_approved = false WHERE id = $2 RETURNING license_doc_url',
       [publicUrl, req.user.id]
     );
+
+    notifyAdminNewDocument(req.user.email, null, "driver's license", 'licencia de conducir');
 
     res.json({ license_doc_url: result.rows[0].license_doc_url });
   } catch (err) {
@@ -1447,6 +1453,29 @@ function formatDateServer(d){
 
 // Envia el correo de aprobacion o rechazo de un documento del carrier (seguro, registro, o licencia).
 // docLabelEn/docLabelEs son solo el nombre del documento en cada idioma, para reusar la misma plantilla.
+// Avisa a los administradores (ADMIN_EMAILS) cuando un carrier sube un documento nuevo, para que
+// no tengan que estar revisando el panel de Admin manualmente cada rato.
+async function notifyAdminNewDocument(carrierEmail, carrierCompanyName, docLabelEn, docLabelEs){
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim()).filter(Boolean);
+  if (adminEmails.length === 0) return;
+
+  const who = carrierCompanyName ? `${carrierCompanyName} (${carrierEmail})` : carrierEmail;
+  const subject = `New ${docLabelEn} to review / Nuevo ${docLabelEs} para revisar`;
+  const html = `
+    <p>A carrier just uploaded a new <strong>${docLabelEn}</strong> and it's ready for your review.</p>
+    <p><strong>Carrier:</strong> ${escapeHtmlServer(who)}</p>
+    <p><a href="https://app.cargasurfreight.com">Go to the Admin panel</a></p>
+    <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+    <p>Un carrier acaba de subir un nuevo <strong>${docLabelEs}</strong> y ya esta listo para tu revision.</p>
+    <p><strong>Carrier:</strong> ${escapeHtmlServer(who)}</p>
+    <p><a href="https://app.cargasurfreight.com">Ir al panel de Admin</a></p>
+  `;
+
+  for (const adminEmail of adminEmails) {
+    sendEmail(adminEmail, subject, html).catch((err) => console.error('No se pudo notificar al admin de nuevo documento:', err));
+  }
+}
+
 async function sendDocumentStatusEmail(email, docLabelEn, docLabelEs, approved, reason){
   const subjectEn = approved ? `Your ${docLabelEn} was approved` : `Your ${docLabelEn} was rejected`;
   const subjectEs = approved ? `Tu ${docLabelEs} fue aprobado` : `Tu ${docLabelEs} fue rechazado`;
