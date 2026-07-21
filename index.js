@@ -941,7 +941,8 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        carrier.license_approved AS carrier_license_approved,
        rating_summary.avg_rating AS carrier_avg_rating,
        rating_summary.review_count AS carrier_review_count,
-       my_review.rating AS my_review_rating
+       my_review.rating AS my_review_rating,
+       COALESCE(unread.unread_count, 0) AS unread_count
      FROM loads
      LEFT JOIN bookings ON bookings.load_id = loads.id AND bookings.payment_status = 'paid'
      LEFT JOIN users carrier ON carrier.id = bookings.carrier_id
@@ -950,6 +951,10 @@ app.get('/api/loads/mine', requireAuth, requireRole('shipper'), async (req, res)
        FROM reviews WHERE reviews.carrier_id = carrier.id AND reviews.review_type = 'shipper_to_carrier'
      ) rating_summary ON true
      LEFT JOIN reviews my_review ON my_review.load_id = loads.id AND my_review.review_type = 'shipper_to_carrier'
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*) AS unread_count FROM messages
+       WHERE messages.load_id = loads.id AND messages.recipient_id = $1 AND messages.read_at IS NULL
+     ) unread ON true
      WHERE loads.shipper_id = $1
      ORDER BY loads.created_at DESC`,
     [req.user.id]
@@ -972,7 +977,8 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
        shipper.profile_photo_url AS shipper_photo_url,
        shipper_rating_summary.avg_rating AS shipper_avg_rating,
        shipper_rating_summary.review_count AS shipper_review_count,
-       my_review.rating AS my_review_of_shipper_rating
+       my_review.rating AS my_review_of_shipper_rating,
+       COALESCE(unread.unread_count, 0) AS unread_count
      FROM bookings
      JOIN loads ON loads.id = bookings.load_id
      JOIN users shipper ON shipper.id = loads.shipper_id
@@ -981,6 +987,10 @@ app.get('/api/loads/booked', requireAuth, requireRole('carrier'), async (req, re
        FROM reviews WHERE reviews.shipper_id = shipper.id AND reviews.review_type = 'carrier_to_shipper'
      ) shipper_rating_summary ON true
      LEFT JOIN reviews my_review ON my_review.load_id = loads.id AND my_review.review_type = 'carrier_to_shipper'
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*) AS unread_count FROM messages
+       WHERE messages.load_id = loads.id AND messages.recipient_id = $1 AND messages.read_at IS NULL
+     ) unread ON true
      WHERE bookings.carrier_id = $1 AND bookings.payment_status = 'paid'
      ORDER BY bookings.created_at DESC`,
     [req.user.id]
