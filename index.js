@@ -2072,6 +2072,115 @@ app.post('/api/admin/users/reactivate', requireAuth, requireAdmin, async (req, r
   res.json({ ok: true, message: `Cuenta de ${user.email} reactivada.` });
 });
 
+// ============================================================
+// CHAT INTERNO (ligado a una carga reservada especifica)
+// ============================================================
+
+// Revisa si el usuario actual puede ver/participar en el chat de esta carga: debe ser el shipper
+// dueno de la carga, o el carrier actualmente asignado (con un booking pagado). Regresa
+// { allowed, otherUserId } o null si no tiene permiso.
+async function getChatParticipants(loadId, userId) {
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return null;
+
+  if (load.shipper_id === userId) {
+    const booking = (await query(
+      `SELECT carrier_id FROM bookings WHERE load_id = $1 AND payment_status = 'paid' ORDER BY created_at DESC LIMIT 1`,
+      [loadId]
+    )).rows[0];
+    if (!booking) return null; // no hay carrier asignado todavia, no hay con quien chatear
+    return { otherUserId: booking.carrier_id };
+  }
+
+  const booking = (await query(
+    `SELECT carrier_id FROM bookings WHERE load_id = $1 AND carrier_id = $2 AND payment_status = 'paid'`,
+    [loadId, userId]
+  )).rows[0];
+  if (booking) return { otherUserId: load.shipper_id };
+
+  return null;
+}
+
+// Ver el historial de mensajes de una carga (solo el shipper o el carrier asignado a esa carga).
+app.get('/api/loads/:id/messages', requireAuth, async (req, res) => {
+  const loadId = req.params.id;
+  const participants = await getChatParticipants(loadId, req.user.id);
+  if (!participants) {
+    return res.status(403).json({ error: 'No tienes acceso al chat de esta carga.' });
+  }
+
+  const result = await query(
+    `SELECT messages.*, sender.company_name AS sender_company_name, sender.role AS sender_role
+     FROM messages
+     JOIN users sender ON sender.id = messages.sender_id
+     WHERE messages.load_id = $1
+     ORDER BY messages.created_at ASC`,
+    [loadId]
+  );
+
+  // Marcar como leidos los mensajes que le mandaron a este usuario
+  await query(
+    `UPDATE messages SET read_at = now() WHERE load_id = $1 AND recipient_id = $2 AND read_at IS NULL`,
+    [loadId, req.user.id]
+  );
+
+  res.json({ messages: result.rows });
+});
+
+// Mandar un mensaje nuevo en el chat de una carga.
+app.post('/api/loads/:id/messages', requireAuth, async (req, res) => {
+  const loadId = req.params.id;
+  const { body, image } = req.body;
+  if ((!body || !body.trim()) && !image) {
+    return res.status(400).json({ error: 'El mensaje no puede estar vacio.' });
+  }
+
+  const participants = await getChatParticipants(loadId, req.user.id);
+  if (!participants) {
+    return res.status(403).json({ error: 'No tienes acceso al chat de esta carga.' });
+  }
+
+  let imageUrl = null;
+  if (image) {
+    const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+    const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+    const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+    }
+    try {
+      const fileName = `chat-${loadId}-${Date.now()}.${ext}`;
+      const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+      const uploadRes = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': `image/${ext}`,
+          'x-upsert': 'true',
+        },
+        body: buffer,
+      });
+      if (!uploadRes.ok) return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+      imageUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+    }
+  }
+
+  const result = await query(
+    `INSERT INTO messages (load_id, sender_id, recipient_id, body, image_url) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [loadId, req.user.id, participants.otherUserId, body ? body.trim() : null, imageUrl]
+  );
+
+  createNotification(participants.otherUserId, loadId, 'new_message').catch((err) => console.error(err));
+
+  res.json({ message: result.rows[0] });
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
 
 const port = process.env.PORT || 4000;
