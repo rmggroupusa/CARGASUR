@@ -2109,13 +2109,20 @@ app.get('/api/loads/:id/messages', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'No tienes acceso al chat de esta carga.' });
   }
 
+  // Filtramos por la pareja actual (yo y la otra persona asignada ahora mismo), no solo por load_id.
+  // Esto evita que, si la carga se reasigno a otro carrier en el pasado, se mezclen o filtren
+  // los mensajes privados de esa conversacion anterior con la conversacion actual.
   const result = await query(
     `SELECT messages.*, sender.company_name AS sender_company_name, sender.role AS sender_role
      FROM messages
      JOIN users sender ON sender.id = messages.sender_id
      WHERE messages.load_id = $1
+       AND (
+         (messages.sender_id = $2 AND messages.recipient_id = $3)
+         OR (messages.sender_id = $3 AND messages.recipient_id = $2)
+       )
      ORDER BY messages.created_at ASC`,
-    [loadId]
+    [loadId, req.user.id, participants.otherUserId]
   );
 
   // Marcar como leidos los mensajes que le mandaron a este usuario
