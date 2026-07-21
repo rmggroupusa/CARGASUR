@@ -1729,6 +1729,31 @@ app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
 // ============================================================
 
 // Lista los carriers que tienen al menos un documento subido y pendiente de aprobar.
+// Lista todos los usuarios de la plataforma (shippers y carriers juntos), para que el admin
+// tenga visibilidad completa, no solo de los pendientes de revision de documentos.
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  const { role } = req.query;
+  const params = [];
+  let where = 'WHERE 1=1';
+  if (role === 'shipper' || role === 'carrier') {
+    params.push(role);
+    where += ` AND role = $${params.length}`;
+  }
+  const result = await query(
+    `SELECT id, email, role, company_name, phone, city, state, mc_number,
+            vehicle_type, vehicle_make, vehicle_model, vehicle_year, vehicle_plate,
+            subscription_status, subscription_plan,
+            insurance_doc_url, registration_doc_url, license_doc_url,
+            insurance_approved, registration_approved, license_approved,
+            deleted_at, admin_deactivated, admin_deactivation_reason, created_at
+     FROM users
+     ${where}
+     ORDER BY created_at DESC`,
+    params
+  );
+  res.json({ users: result.rows });
+});
+
 app.get('/api/admin/pending-carriers', requireAuth, requireAdmin, async (req, res) => {
   const result = await query(
     `SELECT id, email, company_name, phone, mc_number, vehicle_type, vehicle_make, vehicle_model,
