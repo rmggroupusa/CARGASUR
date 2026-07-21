@@ -219,6 +219,11 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Correo o contrasena incorrectos.' });
     }
     if (user.deleted_at) {
+      if (user.admin_deactivated) {
+        return res.status(403).json({
+          error: `Tu cuenta fue suspendida por CargaSur. Motivo: ${user.admin_deactivation_reason || 'no especificado'}. Contacta a soporte para mas informacion.`,
+        });
+      }
       return res.status(403).json({ error: 'Esta cuenta esta desactivada.', can_reactivate: true });
     }
     const sessionId = crypto.randomBytes(24).toString('hex');
@@ -248,6 +253,11 @@ app.post('/api/auth/reactivate', async (req, res) => {
 
     if (!user.deleted_at) {
       return res.status(400).json({ error: 'Esta cuenta ya esta activa.' });
+    }
+    if (user.admin_deactivated) {
+      return res.status(403).json({
+        error: `Tu cuenta fue suspendida por CargaSur. Motivo: ${user.admin_deactivation_reason || 'no especificado'}. Contacta a soporte para mas informacion.`,
+      });
     }
 
     const result2 = await query(
@@ -1066,6 +1076,77 @@ app.post('/api/loads/:id/carrier-cancel', requireAuth, requireRole('carrier'), a
   });
 });
 
+// Confirmar que se recogio la carga, con una foto como evidencia. Esto protege al carrier
+// (por ejemplo, si el shipper despues dice que "nunca llego" o niega el acuerdo de pago 50/50),
+// y no cambia el estado de la carga, solo agrega la evidencia con fecha y hora.
+app.post('/api/loads/:id/confirm-pickup', requireAuth, requireRole('carrier'), async (req, res) => {
+  const loadId = req.params.id;
+  const { image } = req.body;
+  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'Imagen invalida.' });
+  }
+
+  const load = (await query('SELECT * FROM loads WHERE id = $1', [loadId])).rows[0];
+  if (!load) return res.status(404).json({ error: 'Esa carga no existe.' });
+  if (load.status !== 'booked') {
+    return res.status(409).json({ error: 'Solo puedes confirmar la recogida de cargas que esten reservadas.' });
+  }
+
+  const booking = (await query(
+    `SELECT * FROM bookings WHERE load_id = $1 AND carrier_id = $2 AND payment_status = 'paid'`,
+    [loadId, req.user.id]
+  )).rows[0];
+  if (!booking) {
+    return res.status(403).json({ error: 'Esta carga no esta asignada a ti.' });
+  }
+
+  const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+  }
+  const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+  const buffer = Buffer.from(match[2], 'base64');
+  if (buffer.length > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+  }
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+  }
+
+  try {
+    const fileName = `pickup-${loadId}-${Date.now()}.${ext}`;
+    const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': `image/${ext}`,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('Supabase storage upload error (pickup):', errText);
+      return res.status(500).json({ error: 'No se pudo subir la foto.' });
+    }
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+
+    const result = await query(
+      'UPDATE loads SET pickup_proof_url = $1, pickup_confirmed_at = now() WHERE id = $2 RETURNING pickup_proof_url, pickup_confirmed_at',
+      [publicUrl, loadId]
+    );
+
+    createNotification(load.shipper_id, loadId, 'pickup_confirmed').catch((err) => console.error(err));
+
+    res.json({ ok: true, pickup_proof_url: result.rows[0].pickup_proof_url, pickup_confirmed_at: result.rows[0].pickup_confirmed_at });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'No se pudo subir la foto.' });
+  }
+});
+
 // Marcar una carga como entregada (solo el carrier que la reservo)
 app.post('/api/loads/:id/deliver', requireAuth, requireRole('carrier'), async (req, res) => {
   const loadId = req.params.id;
@@ -1867,6 +1948,73 @@ app.post('/api/admin/waitlist/send-launch-announcement', requireAuth, requireAdm
   }
 
   res.json({ ok: true, sentCount, message: `Se envio el anuncio de lanzamiento a ${sentCount} de ${entries.length} personas.` });
+});
+
+// Admin: desactivar la cuenta de cualquier usuario (ej. por no pagar lo acordado). A diferencia
+// de la auto-desactivacion, esta cuenta NO se puede reactivar sola con el login; solo un admin
+// puede revertirla desde aqui.
+app.post('/api/admin/users/deactivate', requireAuth, requireAdmin, async (req, res) => {
+  const { email, reason } = req.body;
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Falta el correo del usuario.' });
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'Debes indicar el motivo de la suspension.' });
+
+  const user = (await query('SELECT * FROM users WHERE email = $1', [email.trim()])).rows[0];
+  if (!user) return res.status(404).json({ error: 'No existe ningun usuario con ese correo.' });
+  if (user.deleted_at) return res.status(400).json({ error: 'Esa cuenta ya esta desactivada.' });
+
+  // Cancelar cualquier membresia activa en Stripe, igual que en la auto-desactivacion.
+  if (user.stripe_customer_id) {
+    try {
+      const subs = await stripe.subscriptions.list({ customer: user.stripe_customer_id, status: 'active' });
+      for (const sub of subs.data) await stripe.subscriptions.cancel(sub.id);
+    } catch (err) {
+      console.error('No se pudo cancelar la suscripcion al suspender la cuenta:', err);
+    }
+  }
+
+  await query(
+    `UPDATE users SET deleted_at = now(), admin_deactivated = true, admin_deactivation_reason = $1,
+            subscription_status = 'cancelled', subscription_plan = NULL
+     WHERE id = $2`,
+    [reason.trim(), user.id]
+  );
+
+  sendEmail(
+    user.email,
+    'Your CargaSur account has been suspended / Tu cuenta de CargaSur fue suspendida',
+    `<p>Your account was suspended by CargaSur.</p><p><strong>Reason:</strong> ${escapeHtmlServer(reason.trim())}</p><p>Contact support if you have questions.</p>
+     <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+     <p>Tu cuenta fue suspendida por CargaSur.</p><p><strong>Motivo:</strong> ${escapeHtmlServer(reason.trim())}</p><p>Contacta a soporte si tienes preguntas.</p>`
+  ).catch((err) => console.error(err));
+
+  res.json({ ok: true, message: `Cuenta de ${user.email} suspendida.` });
+});
+
+// Admin: reactivar una cuenta que el habia suspendido.
+app.post('/api/admin/users/reactivate', requireAuth, requireAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Falta el correo del usuario.' });
+
+  const user = (await query('SELECT * FROM users WHERE email = $1', [email.trim()])).rows[0];
+  if (!user) return res.status(404).json({ error: 'No existe ningun usuario con ese correo.' });
+  if (!user.deleted_at || !user.admin_deactivated) {
+    return res.status(400).json({ error: 'Esa cuenta no esta suspendida por un administrador.' });
+  }
+
+  await query(
+    `UPDATE users SET deleted_at = NULL, admin_deactivated = false, admin_deactivation_reason = NULL WHERE id = $1`,
+    [user.id]
+  );
+
+  sendEmail(
+    user.email,
+    'Your CargaSur account has been reactivated / Tu cuenta de CargaSur fue reactivada',
+    `<p>Good news — your CargaSur account has been reactivated and you can log in again.</p>
+     <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+     <p>Buenas noticias — tu cuenta de CargaSur fue reactivada y ya puedes iniciar sesion de nuevo.</p>`
+  ).catch((err) => console.error(err));
+
+  res.json({ ok: true, message: `Cuenta de ${user.email} reactivada.` });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
