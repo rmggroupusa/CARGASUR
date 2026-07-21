@@ -1754,6 +1754,36 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   res.json({ users: result.rows });
 });
 
+// Muestra toda la actividad de cargas de la plataforma (quien publico, a quien se le asigno, estado),
+// no solo lo de un shipper/carrier en particular. Trae las 150 mas recientes, con filtro opcional
+// por estado, para no cargar todo el historial de un jalon.
+app.get('/api/admin/loads', requireAuth, requireAdmin, async (req, res) => {
+  const { status } = req.query;
+  const validStatuses = ['open', 'booked', 'delivered', 'cancelled', 'pending_payment'];
+  const params = [];
+  let where = 'WHERE 1=1';
+  if (validStatuses.includes(status)) {
+    params.push(status);
+    where += ` AND loads.status = $${params.length}`;
+  }
+  const result = await query(
+    `SELECT
+       loads.id, loads.origin, loads.destination, loads.equipment_type, loads.rate,
+       loads.status, loads.created_at, loads.pickup_date, loads.delivery_date,
+       shipper.id AS shipper_id, shipper.email AS shipper_email, shipper.company_name AS shipper_company_name,
+       carrier.id AS carrier_id, carrier.email AS carrier_email, carrier.company_name AS carrier_company_name
+     FROM loads
+     LEFT JOIN users shipper ON shipper.id = loads.shipper_id
+     LEFT JOIN bookings ON bookings.load_id = loads.id AND bookings.payment_status = 'paid'
+     LEFT JOIN users carrier ON carrier.id = bookings.carrier_id
+     ${where}
+     ORDER BY loads.created_at DESC
+     LIMIT 150`,
+    params
+  );
+  res.json({ loads: result.rows });
+});
+
 app.get('/api/admin/pending-carriers', requireAuth, requireAdmin, async (req, res) => {
   const result = await query(
     `SELECT id, email, company_name, phone, mc_number, vehicle_type, vehicle_make, vehicle_model,
