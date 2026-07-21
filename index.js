@@ -1392,11 +1392,11 @@ app.delete('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, re
   res.json({ ok: true, message: 'Carga eliminada correctamente.' });
 });
 
-async function createNotification(userId, loadId, type){
+async function createNotification(userId, loadId, type, reason){
   try {
     await query(
-      `INSERT INTO notifications (user_id, load_id, type) VALUES ($1,$2,$3)`,
-      [userId, loadId, type]
+      `INSERT INTO notifications (user_id, load_id, type, reason) VALUES ($1,$2,$3,$4)`,
+      [userId, loadId, type, reason || null]
     );
   } catch (err) {
     console.error('No se pudo crear la notificacion:', err);
@@ -2196,6 +2196,114 @@ app.post('/api/loads/:id/messages', requireAuth, async (req, res) => {
   createNotification(participants.otherUserId, loadId, 'new_message').catch((err) => console.error(err));
 
   res.json({ message: result.rows[0] });
+});
+
+// ============================================================
+// REPORTES / DISPUTAS (shipper o carrier reportando un problema en una carga)
+// ============================================================
+
+const REPORT_CATEGORIES = ['no_pago', 'mal_comportamiento', 'no_show', 'otro'];
+const REPORT_CATEGORY_LABELS = {
+  no_pago: { en: 'Non-payment', es: 'No pago' },
+  mal_comportamiento: { en: 'Bad behavior / treatment', es: 'Mal comportamiento / trato' },
+  no_show: { en: 'No-show', es: 'No se presento' },
+  otro: { en: 'Other', es: 'Otro' },
+};
+
+// Reportar un problema con la otra parte de una carga. Reutiliza getChatParticipants (la misma
+// funcion del chat) para identificar automaticamente quien es "la otra persona" de esa carga,
+// asi solo se puede reportar a alguien con quien realmente estas emparejado en un booking pagado.
+app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
+  const loadId = req.params.id;
+  const { category, description } = req.body;
+  if (!REPORT_CATEGORIES.includes(category)) {
+    return res.status(400).json({ error: 'Motivo de reporte invalido.' });
+  }
+
+  const participants = await getChatParticipants(loadId, req.user.id);
+  if (!participants) {
+    return res.status(403).json({ error: 'No puedes reportar en esta carga.' });
+  }
+  const reportedId = participants.otherUserId;
+  const labels = REPORT_CATEGORY_LABELS[category];
+
+  const result = await query(
+    `INSERT INTO reports (load_id, reporter_id, reported_id, category, description, status)
+     VALUES ($1,$2,$3,$4,$5,'pending') RETURNING *`,
+    [loadId, req.user.id, reportedId, category, description ? description.trim() : null]
+  );
+
+  // Notificacion en la app para la persona reportada (generica: no dice quien la reporto).
+  createNotification(reportedId, loadId, 'reported', labels.es).catch((err) => console.error(err));
+
+  // Correo generico a la persona reportada.
+  try {
+    const reportedUser = (await query('SELECT email FROM users WHERE id = $1', [reportedId])).rows[0];
+    if (reportedUser) {
+      sendEmail(
+        reportedUser.email,
+        'A report was filed regarding one of your loads / Se registro un reporte sobre una de tus cargas',
+        `<p>A report was filed regarding your activity on a recent load.</p>
+         <p><strong>Reason:</strong> ${escapeHtmlServer(labels.en)}</p>
+         <p>If you believe this was made in error, please contact us at cargasur_rmgcontrol@outlook.com.</p>
+         <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
+         <p>Se registro un reporte relacionado con tu actividad en una carga reciente.</p>
+         <p><strong>Motivo:</strong> ${escapeHtmlServer(labels.es)}</p>
+         <p>Si crees que esto fue un error, contactanos en cargasur_rmgcontrol@outlook.com.</p>`
+      ).catch((err) => console.error('No se pudo enviar el correo de reporte a la persona reportada:', err));
+    }
+  } catch (err) {
+    console.error('No se pudo buscar el correo de la persona reportada:', err);
+  }
+
+  // Correo con el detalle completo para el/los admin(s).
+  try {
+    const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim()).filter(Boolean);
+    if (adminEmails.length > 0) {
+      const reporterUser = (await query('SELECT email, company_name FROM users WHERE id = $1', [req.user.id])).rows[0];
+      const reportedUserFull = (await query('SELECT email, company_name FROM users WHERE id = $1', [reportedId])).rows[0];
+      const subject = 'New report filed / Nuevo reporte registrado';
+      const html = `
+        <p>A new report was filed on the platform.</p>
+        <p><strong>Load ID:</strong> ${escapeHtmlServer(loadId)}</p>
+        <p><strong>Reported by:</strong> ${escapeHtmlServer(reporterUser ? (reporterUser.company_name || reporterUser.email) : req.user.id)}</p>
+        <p><strong>Reported user:</strong> ${escapeHtmlServer(reportedUserFull ? (reportedUserFull.company_name || reportedUserFull.email) : reportedId)}</p>
+        <p><strong>Category:</strong> ${escapeHtmlServer(labels.en)}</p>
+        <p><strong>Description:</strong> ${escapeHtmlServer(description || '(none)')}</p>
+        <p><a href="https://app.cargasurfreight.com">Go to the Admin panel</a></p>
+      `;
+      for (const adminEmail of adminEmails) {
+        sendEmail(adminEmail, subject, html).catch((err) => console.error('No se pudo notificar al admin del reporte:', err));
+      }
+    }
+  } catch (err) {
+    console.error('No se pudo armar el correo de reporte para el admin:', err);
+  }
+
+  res.json({ report: result.rows[0] });
+});
+
+// Lista de reportes para el panel de Admin (los mas recientes primero).
+app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
+  const result = await query(
+    `SELECT reports.*,
+            reporter.email AS reporter_email, reporter.company_name AS reporter_company_name,
+            reported.id AS reported_user_id, reported.email AS reported_email, reported.company_name AS reported_company_name,
+            loads.origin, loads.destination
+     FROM reports
+     JOIN users reporter ON reporter.id = reports.reporter_id
+     JOIN users reported ON reported.id = reports.reported_id
+     LEFT JOIN loads ON loads.id = reports.load_id
+     ORDER BY reports.created_at DESC
+     LIMIT 100`
+  );
+  res.json({ reports: result.rows });
+});
+
+// Marcar un reporte como revisado (no borra nada, solo cambia el estado para sacarlo de "pendientes").
+app.post('/api/admin/reports/:id/reviewed', requireAuth, requireAdmin, async (req, res) => {
+  await query(`UPDATE reports SET status = 'reviewed' WHERE id = $1`, [req.params.id]);
+  res.json({ ok: true });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
