@@ -2215,7 +2215,7 @@ const REPORT_CATEGORY_LABELS = {
 // asi solo se puede reportar a alguien con quien realmente estas emparejado en un booking pagado.
 app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
   const loadId = req.params.id;
-  const { category, description } = req.body;
+  const { category, description, image } = req.body;
   if (!REPORT_CATEGORIES.includes(category)) {
     return res.status(400).json({ error: 'Motivo de reporte invalido.' });
   }
@@ -2227,10 +2227,42 @@ app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
   const reportedId = participants.otherUserId;
   const labels = REPORT_CATEGORY_LABELS[category];
 
+  // Foto de evidencia (opcional) - mismo patron de subida que las imagenes del chat.
+  let imageUrl = null;
+  if (image) {
+    const match = image.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Formato de imagen no soportado. Usa PNG, JPG o WEBP.' });
+    const ext = match[1] === 'jpg' ? 'jpeg' : match[1];
+    const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'El archivo no puede pesar mas de 5MB.' });
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ error: 'Almacenamiento de archivos no configurado en el servidor.' });
+    }
+    try {
+      const fileName = `report-${loadId}-${Date.now()}.${ext}`;
+      const uploadUrl = `${process.env.SUPABASE_URL}/storage/v1/object/documents/${fileName}`;
+      const uploadRes = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': `image/${ext}`,
+          'x-upsert': 'true',
+        },
+        body: buffer,
+      });
+      if (!uploadRes.ok) return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+      imageUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/documents/${fileName}`;
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+    }
+  }
+
   const result = await query(
-    `INSERT INTO reports (load_id, reporter_id, reported_id, category, description, status)
-     VALUES ($1,$2,$3,$4,$5,'pending') RETURNING *`,
-    [loadId, req.user.id, reportedId, category, description ? description.trim() : null]
+    `INSERT INTO reports (load_id, reporter_id, reported_id, category, description, image_url, status)
+     VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
+    [loadId, req.user.id, reportedId, category, description ? description.trim() : null, imageUrl]
   );
 
   // Notificacion en la app para la persona reportada (generica: no dice quien la reporto).
@@ -2270,6 +2302,7 @@ app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
         <p><strong>Reported user:</strong> ${escapeHtmlServer(reportedUserFull ? (reportedUserFull.company_name || reportedUserFull.email) : reportedId)}</p>
         <p><strong>Category:</strong> ${escapeHtmlServer(labels.en)}</p>
         <p><strong>Description:</strong> ${escapeHtmlServer(description || '(none)')}</p>
+        ${imageUrl ? `<p><strong>Photo:</strong> <a href="${imageUrl}">${imageUrl}</a></p>` : ''}
         <p><a href="https://app.cargasurfreight.com">Go to the Admin panel</a></p>
       `;
       for (const adminEmail of adminEmails) {
