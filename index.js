@@ -137,6 +137,9 @@ app.post('/api/auth/register', async (req, res) => {
   if (!email || !password || !role) {
     return res.status(400).json({ error: 'Faltan campos obligatorios: email, password, role.' });
   }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'La contrasena debe tener al menos 6 caracteres.' });
+  }
   if (!['shipper', 'carrier'].includes(role)) {
     return res.status(400).json({ error: 'El rol debe ser "shipper" o "carrier".' });
   }
@@ -1427,7 +1430,16 @@ app.post('/api/loads/:id/book', requireAuth, requireRole('carrier'), async (req,
 
   // Si tiene membresia mensual activa de carrier: reserva directa, sin cobro extra
   if (carrier.subscription_status === 'active' && carrier.subscription_plan === 'carrier_monthly') {
-    await query('UPDATE loads SET status = $1 WHERE id = $2', ['booked', loadId]);
+    // UPDATE atomico con WHERE status='open': si otro carrier ya la reservo entre el momento en
+    // que la revisamos arriba y ahora, esta consulta simplemente no actualiza nada (rowCount=0),
+    // en vez de dejar que dos carriers terminen reservando la misma carga.
+    const updateResult = await query(
+      `UPDATE loads SET status = 'booked' WHERE id = $1 AND status = 'open' RETURNING id`,
+      [loadId]
+    );
+    if (updateResult.rows.length === 0) {
+      return res.status(409).json({ error: 'Esta carga ya no esta disponible (alguien mas la reservo primero).' });
+    }
     await query(
       `INSERT INTO bookings (load_id, carrier_id, payment_type, payment_status, amount)
        VALUES ($1,$2,'subscription','paid',0)`,
@@ -1688,7 +1700,37 @@ async function handleCheckoutCompleted(session) {
     const carrierId = session.metadata && session.metadata.carrier_id;
     if (loadId) {
       await query('UPDATE bookings SET payment_status = $1 WHERE stripe_checkout_session_id = $2', ['paid', session.id]);
-      const loadResult = await query('UPDATE loads SET status = $1 WHERE id = $2 RETURNING shipper_id', ['booked', loadId]);
+      // UPDATE atomico con WHERE status='open': protege contra que dos carriers paguen casi al
+      // mismo tiempo por la misma carga. Si esto no actualiza nada, quiere decir que la carga
+      // ya fue reservada por alguien mas ANTES de que este pago se confirmara - pero el cobro en
+      // Stripe ya se hizo, asi que no podemos simplemente cancelarlo: hay que avisar al admin
+      // para que procese un reembolso manual, y avisarle al carrier que hubo un conflicto.
+      const loadResult = await query(
+        `UPDATE loads SET status = 'booked' WHERE id = $1 AND status = 'open' RETURNING shipper_id`,
+        [loadId]
+      );
+      if (loadResult.rows.length === 0) {
+        console.error(`CONFLICTO DE RESERVA: la carga ${loadId} ya estaba reservada cuando se confirmo el pago del carrier ${carrierId} (sesion de Stripe ${session.id}). Requiere reembolso manual.`);
+        if (carrierId) {
+          createNotification(carrierId, loadId, 'booking_conflict_refund_pending').catch((err) => console.error(err));
+        }
+        try {
+          const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim()).filter(Boolean);
+          for (const adminEmail of adminEmails) {
+            sendEmail(
+              adminEmail,
+              '⚠️ Reservation conflict - manual refund needed / Conflicto de reserva - reembolso manual necesario',
+              `<p>Load #${escapeHtmlServer(loadId)} was already booked when a payment from another carrier was confirmed.</p>
+               <p><strong>Carrier charged:</strong> ${escapeHtmlServer(carrierId || '')}</p>
+               <p><strong>Stripe checkout session:</strong> ${escapeHtmlServer(session.id)}</p>
+               <p>Please process a manual refund from your Stripe Dashboard and let the carrier know.</p>`
+            ).catch((err) => console.error('No se pudo notificar al admin del conflicto de reserva:', err));
+          }
+        } catch (err) {
+          console.error('No se pudo armar el correo de conflicto de reserva:', err);
+        }
+        return;
+      }
       if (carrierId) {
         sendLoadAssignedEmail(carrierId, loadId).catch((err) => console.error(err));
       }
