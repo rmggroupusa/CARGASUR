@@ -2322,6 +2322,28 @@ app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
 // ============================================================
 // Cada metrica se calcula por separado (Promise.allSettled) para que si alguna
 // consulta puntual falla, el resto del panel siga funcionando en vez de romperse todo.
+// Respaldo manual para el admin: usuarios (sin contraseñas ni tokens), cargas, reservas y
+// reportes. El frontend convierte esto a CSV directamente en el navegador.
+app.get('/api/admin/export', requireAuth, requireAdmin, async (req, res) => {
+  const [usersResult, loadsResult, bookingsResult, reportsResult] = await Promise.all([
+    query(`SELECT id, email, role, company_name, phone, city, state, mc_number,
+                  vehicle_type, vehicle_make, vehicle_model, vehicle_year, vehicle_plate,
+                  subscription_status, subscription_plan,
+                  insurance_approved, registration_approved, license_approved,
+                  deleted_at, admin_deactivated, admin_deactivation_reason, created_at
+           FROM users ORDER BY created_at DESC`),
+    query(`SELECT * FROM loads ORDER BY created_at DESC`),
+    query(`SELECT * FROM bookings ORDER BY created_at DESC`),
+    query(`SELECT * FROM reports ORDER BY created_at DESC`),
+  ]);
+  res.json({
+    users: usersResult.rows,
+    loads: loadsResult.rows,
+    bookings: bookingsResult.rows,
+    reports: reportsResult.rows,
+  });
+});
+
 app.get('/api/admin/metrics', requireAuth, requireAdmin, async (req, res) => {
   const metricQueries = {
     loadsTotal: `SELECT COUNT(*)::int AS c FROM loads`,
