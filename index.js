@@ -2317,6 +2317,53 @@ app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
 });
 
 // Lista de reportes para el panel de Admin (los mas recientes primero).
+// ============================================================
+// METRICAS SIMPLES PARA EL PANEL DE ADMIN
+// ============================================================
+// Cada metrica se calcula por separado (Promise.allSettled) para que si alguna
+// consulta puntual falla, el resto del panel siga funcionando en vez de romperse todo.
+app.get('/api/admin/metrics', requireAuth, requireAdmin, async (req, res) => {
+  const metricQueries = {
+    loadsTotal: `SELECT COUNT(*)::int AS c FROM loads`,
+    loadsWeek: `SELECT COUNT(*)::int AS c FROM loads WHERE created_at >= now() - interval '7 days'`,
+    loadsDeliveredTotal: `SELECT COUNT(*)::int AS c FROM loads WHERE status = 'delivered'`,
+    usersShippers: `SELECT COUNT(*)::int AS c FROM users WHERE role = 'shipper' AND deleted_at IS NULL`,
+    usersCarriers: `SELECT COUNT(*)::int AS c FROM users WHERE role = 'carrier' AND deleted_at IS NULL`,
+    usersNewWeek: `SELECT COUNT(*)::int AS c FROM users WHERE created_at >= now() - interval '7 days' AND deleted_at IS NULL`,
+    perLoadRevenue: `SELECT COALESCE(SUM(amount),0)::float AS c FROM bookings WHERE payment_type = 'per_load' AND payment_status = 'paid'`,
+    activeShipperMemberships: `SELECT COUNT(*)::int AS c FROM users WHERE role = 'shipper' AND subscription_status = 'active'`,
+    activeCarrierMemberships: `SELECT COUNT(*)::int AS c FROM users WHERE role = 'carrier' AND subscription_status = 'active'`,
+    waitlistTotal: `SELECT COUNT(*)::int AS c FROM waitlist`,
+    waitlistWeek: `SELECT COUNT(*)::int AS c FROM waitlist WHERE created_at >= now() - interval '7 days'`,
+    waitlistNotified: `SELECT COUNT(*)::int AS c FROM waitlist WHERE notified_at IS NOT NULL`,
+  };
+
+  const keys = Object.keys(metricQueries);
+  const results = await Promise.allSettled(keys.map((k) => query(metricQueries[k])));
+
+  const metrics = {};
+  results.forEach((result, i) => {
+    const key = keys[i];
+    if (result.status === 'fulfilled') {
+      metrics[key] = result.value.rows[0].c;
+    } else {
+      console.error(`No se pudo calcular la metrica "${key}":`, result.reason.message || result.reason);
+      metrics[key] = null;
+    }
+  });
+
+  // Lista de espera agrupada por rol (shipper/carrier), aparte porque devuelve varias filas.
+  try {
+    const byRole = await query(`SELECT role_type, COUNT(*)::int AS c FROM waitlist GROUP BY role_type`);
+    metrics.waitlistByRole = byRole.rows;
+  } catch (err) {
+    console.error('No se pudo calcular waitlist por rol:', err.message || err);
+    metrics.waitlistByRole = [];
+  }
+
+  res.json({ metrics });
+});
+
 app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
   const result = await query(
     `SELECT reports.*,
