@@ -2277,11 +2277,11 @@ app.post('/api/loads/:id/report', requireAuth, async (req, res) => {
         'A report was filed regarding one of your loads / Se registro un reporte sobre una de tus cargas',
         `<p>A report was filed regarding your activity on a recent load.</p>
          <p><strong>Reason:</strong> ${escapeHtmlServer(labels.en)}</p>
-         <p>If you believe this was made in error, please contact us at cargasur_rmgcontrol@outlook.com.</p>
+         <p>If you believe this was made in error, please contact us at support@cargasurfreight.com.</p>
          <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
          <p>Se registro un reporte relacionado con tu actividad en una carga reciente.</p>
          <p><strong>Motivo:</strong> ${escapeHtmlServer(labels.es)}</p>
-         <p>Si crees que esto fue un error, contactanos en cargasur_rmgcontrol@outlook.com.</p>`
+         <p>Si crees que esto fue un error, contactanos en support@cargasurfreight.com.</p>`
       ).catch((err) => console.error('No se pudo enviar el correo de reporte a la persona reportada:', err));
     }
   } catch (err) {
