@@ -725,8 +725,8 @@ app.post('/api/loads', requireAuth, requireRole('shipper'), async (req, res) => 
     origin_lat, origin_lng, destination_lat, destination_lng, wants_insurance,
     length_feet, length_inches,
   } = req.body;
-  if (!origin || !destination || !equipment_type || !rate) {
-    return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
+  if (!origin || !destination || !equipment_type || !rate || !origin_address || !destination_address) {
+    return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate, origin_address, destination_address.' });
   }
 
   // Codigo de 6 digitos que el shipper debe entregar a la persona que recibe la carga en destino.
@@ -1356,8 +1356,8 @@ app.put('/api/loads/:id', requireAuth, requireRole('shipper'), async (req, res) 
     origin_lat, origin_lng, destination_lat, destination_lng, wants_insurance,
     length_feet, length_inches,
   } = req.body;
-  if (!origin || !destination || !equipment_type || !rate) {
-    return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate.' });
+  if (!origin || !destination || !equipment_type || !rate || !origin_address || !destination_address) {
+    return res.status(400).json({ error: 'Faltan campos obligatorios: origin, destination, equipment_type, rate, origin_address, destination_address.' });
   }
 
   const result = await query(
