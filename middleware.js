@@ -1,15 +1,10 @@
 const { verifyToken } = require('./auth');
 const { query } = require('./db');
 
-function isAdminEmail(email){
-  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-  return adminEmails.includes((email || '').toLowerCase());
-}
-
-// Modo mantenimiento: mientras este activo, solo el/los admin(es) pueden seguir usando rutas
-// que requieren sesion. Se guarda en la misma tabla platform_settings que el interruptor de
-// lanzamiento (backend-index.js tiene su propia copia de este helper para sus propios endpoints
-// publicos; esta copia es la que protege las rutas autenticadas).
+// Modo mantenimiento: mientras este activo, solo las cuentas con role='admin' pueden seguir
+// usando rutas que requieren sesion. Se guarda en la tabla platform_settings (backend-index.js
+// tiene su propia copia de este helper para sus propios endpoints publicos; esta copia es la
+// que protege las rutas autenticadas).
 async function isMaintenanceMode(){
   try {
     const result = await query(`SELECT value FROM platform_settings WHERE key = 'maintenance_mode'`);
@@ -45,10 +40,9 @@ async function requireAuth(req, res, next) {
     if (dbUser.deleted_at) {
       return res.status(401).json({ error: 'Tu cuenta fue suspendida. Contacta a soporte si crees que esto es un error.', account_suspended: true });
     }
-    // Modo mantenimiento: si esta activo y esta persona no es admin, se bloquea el acceso a
-    // cualquier ruta autenticada (publicar, reservar, chatear, etc.), sin cerrarle la sesion -
-    // simplemente no puede hacer nada mientras dure el mantenimiento.
-    if (!isAdminEmail(decoded.email) && await isMaintenanceMode()) {
+    // Modo mantenimiento: si esta activo y esta persona no es admin (por rol real, no por
+    // correo), se bloquea el acceso a cualquier ruta autenticada, sin cerrarle la sesion.
+    if (decoded.role !== 'admin' && await isMaintenanceMode()) {
       return res.status(503).json({ error: 'La plataforma esta en mantenimiento en este momento. Vuelve a intentarlo en un rato.', maintenance_mode: true });
     }
   } catch (err) {
@@ -68,10 +62,10 @@ function requireRole(role) {
   };
 }
 
-// Solo deja pasar si el correo de la sesion esta en la lista de administradores
-// (variable de entorno ADMIN_EMAILS, separada por comas).
+// Solo deja pasar si el rol de la sesion es 'admin' - un rol real en la base de datos, no una
+// lista de correos comparados a mano. El rol ya viaja dentro del token (se firma en el login).
 function requireAdmin(req, res, next) {
-  if (!req.user || !isAdminEmail(req.user.email)) {
+  if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ error: 'No tienes permiso de administrador para esta accion.' });
   }
   next();
