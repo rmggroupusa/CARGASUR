@@ -30,10 +30,6 @@ async function isMaintenanceMode(){
     return false; // ante la duda, mejor no bloquear a nadie por un error de lectura
   }
 }
-function isAdminEmail(email){
-  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-  return adminEmails.includes((email || '').toLowerCase());
-}
 const { hashPassword, comparePassword, signToken } = require('./auth');
 const { requireAuth, requireRole, requireAdmin } = require('./middleware');
 
