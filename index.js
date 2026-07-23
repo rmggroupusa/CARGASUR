@@ -386,9 +386,31 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
     }
 
     // Si ya estaba firmada antes, no permitir "des-firmar"; si se envia una firma nueva, guardar fecha actual.
-    const existing = (await query('SELECT attestation_signed, attestation_signed_at FROM users WHERE id = $1', [req.user.id])).rows[0];
+    const existing = (await query(
+      `SELECT attestation_signed, attestation_signed_at,
+              vehicle_type, vehicle_make, vehicle_model, vehicle_year, vehicle_plate,
+              insurance_approved, registration_approved
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    )).rows[0];
     const willBeSigned = existing.attestation_signed || !!attestation_signed;
     const signedAt = existing.attestation_signed_at || (attestation_signed ? new Date() : null);
+
+    // Red de seguridad del lado del servidor: si cambian los datos del vehiculo (marca, modelo,
+    // año, placa o tipo), se obliga a revisar de nuevo el seguro y la registracion - aunque
+    // alguien intente saltarse la validacion del frontend llamando a esta API directamente.
+    // (El frontend ya exige subir documentos nuevos ANTES de llegar aqui, lo cual ya deja
+    // insurance_approved/registration_approved en false via esos otros endpoints; esto solo
+    // cubre el caso de que alguien mande el cambio de vehiculo sin pasar por ese flujo.)
+    const vehicleChanged = req.user.role === 'carrier' && (
+      (vehicle_type || null) !== existing.vehicle_type ||
+      (vehicle_make || null) !== existing.vehicle_make ||
+      (vehicle_model || null) !== existing.vehicle_model ||
+      (vehicle_year || null) !== existing.vehicle_year ||
+      (vehicle_plate || null) !== existing.vehicle_plate
+    );
+    const insuranceApproved = vehicleChanged ? false : existing.insurance_approved;
+    const registrationApproved = vehicleChanged ? false : existing.registration_approved;
 
     const result = await query(
       `UPDATE users SET
@@ -396,7 +418,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
          mc_number = $5, vehicle_type = $6, vehicle_make = $7, vehicle_model = $8,
          vehicle_year = $9, vehicle_plate = $10, license_number = $11, license_state = $12,
          ein_number = $13, business_address = $14, attestation_signed = $15, attestation_name = $16,
-         attestation_signed_at = $17
+         attestation_signed_at = $17, insurance_approved = $19, registration_approved = $20
        WHERE id = $18
        RETURNING id, email, role, company_name, phone, city, state, mc_number, vehicle_type,
                  vehicle_make, vehicle_model, vehicle_year, vehicle_plate, license_number, license_state,
@@ -407,7 +429,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
         vehicle_year || null, vehicle_plate || null, license_number || null, license_state || null,
         ein_number || null, business_address || null, willBeSigned, attestation_name || existing.attestation_name || null,
-        signedAt, req.user.id,
+        signedAt, req.user.id, insuranceApproved, registrationApproved,
       ]
     );
     res.json({ user: result.rows[0] });
