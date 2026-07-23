@@ -17,6 +17,23 @@ async function isPlatformLaunched(){
     return false; // ante la duda, nos quedamos en "no lanzado" (mas seguro que abrir por error)
   }
 }
+
+// Modo mantenimiento: mientras este activo, ningun usuario normal puede hacer acciones que
+// requieran sesion (publicar, reservar, chatear, etc.) - solo el/los admin(es) siguen teniendo
+// acceso completo, para poder seguir trabajando mientras se resuelve lo que sea.
+async function isMaintenanceMode(){
+  try {
+    const result = await query(`SELECT value FROM platform_settings WHERE key = 'maintenance_mode'`);
+    return !!result.rows[0] && result.rows[0].value === 'true';
+  } catch (err) {
+    console.error('No se pudo leer el interruptor de mantenimiento:', err);
+    return false; // ante la duda, mejor no bloquear a nadie por un error de lectura
+  }
+}
+function isAdminEmail(email){
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  return adminEmails.includes((email || '').toLowerCase());
+}
 const { hashPassword, comparePassword, signToken } = require('./auth');
 const { requireAuth, requireRole, requireAdmin } = require('./middleware');
 
@@ -2483,6 +2500,22 @@ app.post('/api/admin/launch', requireAuth, requireAdmin, async (req, res) => {
     [launched ? 'true' : 'false']
   );
   res.json({ ok: true, launched: !!launched });
+});
+
+// Modo mantenimiento: publico (para que la app sepa mostrar la pantalla de mantenimiento incluso
+// sin haber iniciado sesion) y el endpoint para que el Admin lo prenda/apague.
+app.get('/api/maintenance-status', async (req, res) => {
+  res.json({ maintenance: await isMaintenanceMode() });
+});
+
+app.post('/api/admin/maintenance', requireAuth, requireAdmin, async (req, res) => {
+  const { maintenance } = req.body;
+  await query(
+    `INSERT INTO platform_settings (key, value) VALUES ('maintenance_mode', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [maintenance ? 'true' : 'false']
+  );
+  res.json({ ok: true, maintenance: !!maintenance });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
