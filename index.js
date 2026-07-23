@@ -363,7 +363,28 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
     attestation_signed, attestation_name,
   } = req.body;
 
+  const phoneClean = (phone || '').trim();
+  if (!phoneClean) {
+    return res.status(400).json({ error: 'El telefono es obligatorio.' });
+  }
+
   try {
+    // Misma regla que en el registro: un telefono no puede repetirse en dos cuentas del mismo
+    // rol (excluyendo la propia cuenta, para que la persona pueda "guardar" su mismo telefono
+    // sin que se auto-rechace). Respeta la misma excepcion consumible del Admin.
+    const samePhoneAndRole = await query(
+      'SELECT id FROM users WHERE phone = $1 AND role = $2 AND id != $3 AND deleted_at IS NULL',
+      [phoneClean, req.user.role, req.user.id]
+    );
+    if (samePhoneAndRole.rows.length) {
+      const override = await query('SELECT phone FROM phone_overrides WHERE phone = $1', [phoneClean]);
+      if (override.rows.length) {
+        await query('DELETE FROM phone_overrides WHERE phone = $1', [phoneClean]);
+      } else {
+        return res.status(409).json({ error: 'Ya existe una cuenta de ' + req.user.role + ' con ese numero de telefono.' });
+      }
+    }
+
     // Si ya estaba firmada antes, no permitir "des-firmar"; si se envia una firma nueva, guardar fecha actual.
     const existing = (await query('SELECT attestation_signed, attestation_signed_at FROM users WHERE id = $1', [req.user.id])).rows[0];
     const willBeSigned = existing.attestation_signed || !!attestation_signed;
@@ -382,7 +403,7 @@ app.put('/api/auth/profile', requireAuth, async (req, res) => {
                  ein_number, business_address, attestation_signed, attestation_name, attestation_signed_at,
                  subscription_status, subscription_plan, profile_photo_url, insurance_doc_url, registration_doc_url, license_doc_url, insurance_approved, registration_approved, license_approved`,
       [
-        company_name || null, phone || null, city || null, state || null,
+        company_name || null, phoneClean, city || null, state || null,
         mc_number || null, vehicle_type || null, vehicle_make || null, vehicle_model || null,
         vehicle_year || null, vehicle_plate || null, license_number || null, license_state || null,
         ein_number || null, business_address || null, willBeSigned, attestation_name || existing.attestation_name || null,
