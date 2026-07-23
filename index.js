@@ -351,6 +351,28 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 });
 
 // Completar/actualizar el perfil despues del registro (vehiculo, licencia, EIN, direccion, etc.)
+// Verificacion rapida y de solo lectura (no guarda nada, no consume ninguna autorizacion) para
+// revisar si un telefono chocaria con la regla de "una cuenta por rol" ANTES de subir documentos
+// pesados - evita el caso de subir seguro/registracion nuevos y que despues falle por el telefono.
+app.post('/api/auth/check-phone', requireAuth, async (req, res) => {
+  const phoneClean = (req.body.phone || '').trim();
+  if (!phoneClean) {
+    return res.json({ ok: false, error: 'El telefono es obligatorio.' });
+  }
+  const samePhoneAndRole = await query(
+    'SELECT id FROM users WHERE phone = $1 AND role = $2 AND id != $3 AND deleted_at IS NULL',
+    [phoneClean, req.user.role, req.user.id]
+  );
+  if (!samePhoneAndRole.rows.length) {
+    return res.json({ ok: true });
+  }
+  const override = await query('SELECT phone FROM phone_overrides WHERE phone = $1', [phoneClean]);
+  if (override.rows.length) {
+    return res.json({ ok: true }); // no se consume aqui - la consume el guardado real despues
+  }
+  return res.json({ ok: false, error: 'Ya existe una cuenta de ' + req.user.role + ' con ese numero de telefono.' });
+});
+
 app.put('/api/auth/profile', requireAuth, async (req, res) => {
   const {
     company_name, phone, city, state,
