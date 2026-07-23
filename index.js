@@ -4,6 +4,19 @@ const cors = require('cors');
 const Stripe = require('stripe');
 
 const { query } = require('./db');
+
+// Interruptor de lanzamiento oficial, guardado en la base de datos (tabla platform_settings)
+// en vez de una variable de entorno - asi el Admin lo puede cambiar con un boton, al instante,
+// sin tener que entrar a Render ni reiniciar el servidor.
+async function isPlatformLaunched(){
+  try {
+    const result = await query(`SELECT value FROM platform_settings WHERE key = 'launched'`);
+    return !!result.rows[0] && result.rows[0].value === 'true';
+  } catch (err) {
+    console.error('No se pudo leer el interruptor de lanzamiento:', err);
+    return false; // ante la duda, nos quedamos en "no lanzado" (mas seguro que abrir por error)
+  }
+}
 const { hashPassword, comparePassword, signToken } = require('./auth');
 const { requireAuth, requireRole, requireAdmin } = require('./middleware');
 
@@ -128,6 +141,10 @@ app.use(express.json({ limit: '10mb' }));
 // ============================================================
 
 app.post('/api/auth/register', async (req, res) => {
+  if (!(await isPlatformLaunched())) {
+    return res.status(403).json({ error: 'Todavía no hemos lanzado oficialmente. Únete a la lista de espera en cargasurfreight.com.', not_launched: true });
+  }
+
   const {
     email, password, role, company_name, phone, city, state,
     mc_number, vehicle_type, vehicle_make, vehicle_model, vehicle_year,
@@ -2448,6 +2465,24 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
 app.post('/api/admin/reports/:id/reviewed', requireAuth, requireAdmin, async (req, res) => {
   await query(`UPDATE reports SET status = 'reviewed' WHERE id = $1`, [req.params.id]);
   res.json({ ok: true });
+});
+
+// Interruptor unico de lanzamiento, guardado en la base de datos (tabla platform_settings):
+// mientras siga en "false", tanto la app como la landing muestran "aun no hemos lanzado" en
+// vez de dejar crear cuentas nuevas. El Admin lo activa con un boton en su panel, sin tocar
+// Render ni volver a desplegar nada.
+app.get('/api/launch-status', async (req, res) => {
+  res.json({ launched: await isPlatformLaunched() });
+});
+
+app.post('/api/admin/launch', requireAuth, requireAdmin, async (req, res) => {
+  const { launched } = req.body;
+  await query(
+    `INSERT INTO platform_settings (key, value) VALUES ('launched', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [launched ? 'true' : 'false']
+  );
+  res.json({ ok: true, launched: !!launched });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
