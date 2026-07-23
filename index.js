@@ -177,11 +177,33 @@ app.post('/api/auth/register', async (req, res) => {
   if (!['shipper', 'carrier'].includes(role)) {
     return res.status(400).json({ error: 'El rol debe ser "shipper" o "carrier".' });
   }
+  const phoneClean = (phone || '').trim();
+  if (!phoneClean) {
+    return res.status(400).json({ error: 'El telefono es obligatorio.' });
+  }
 
   try {
     const existing = await query('SELECT id FROM users WHERE email = $1', [email]);
     if (existing.rows.length) {
       return res.status(409).json({ error: 'Ya existe una cuenta con ese correo.' });
+    }
+
+    // Un mismo telefono puede tener una cuenta shipper Y una carrier (ej. la misma empresa),
+    // pero no dos cuentas del mismo rol - esto evita que alguien abra varias cuentas de prueba
+    // con el mismo numero usando correos distintos. Si el Admin autorizo una excepcion puntual
+    // para este telefono (tabla phone_overrides), se deja pasar una vez y se consume la
+    // autorizacion (se borra), en vez de quedar como un permiso permanente sin querer.
+    const samePhoneAndRole = await query(
+      'SELECT id FROM users WHERE phone = $1 AND role = $2 AND deleted_at IS NULL',
+      [phoneClean, role]
+    );
+    if (samePhoneAndRole.rows.length) {
+      const override = await query('SELECT phone FROM phone_overrides WHERE phone = $1', [phoneClean]);
+      if (override.rows.length) {
+        await query('DELETE FROM phone_overrides WHERE phone = $1', [phoneClean]);
+      } else {
+        return res.status(409).json({ error: 'Ya existe una cuenta de ' + role + ' con ese numero de telefono.' });
+      }
     }
 
     const password_hash = await hashPassword(password);
@@ -1839,6 +1861,42 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   );
   res.json({ users: result.rows });
 });
+
+// Editar el telefono de un usuario existente (ej. si se equivoco al escribirlo al registrarse).
+// No aplica el chequeo de unicidad por rol - es una correccion administrativa directa.
+app.post('/api/admin/users/edit-phone', requireAuth, requireAdmin, async (req, res) => {
+  const { email, phone } = req.body;
+  const phoneClean = (phone || '').trim();
+  if (!email || !phoneClean) {
+    return res.status(400).json({ error: 'Faltan datos: email y phone.' });
+  }
+  const result = await query(
+    'UPDATE users SET phone = $1 WHERE email = $2 RETURNING id, email, phone',
+    [phoneClean, email]
+  );
+  if (!result.rows.length) {
+    return res.status(404).json({ error: 'No existe ningun usuario con ese correo.' });
+  }
+  res.json({ ok: true, user: result.rows[0] });
+});
+
+// Autorizar que un numero de telefono especifico pueda abrir una cuenta extra (mas alla del
+// limite normal de una cuenta por rol). La autorizacion se consume sola la primera vez que
+// alguien se registra con ese telefono.
+app.post('/api/admin/phone-overrides', requireAuth, requireAdmin, async (req, res) => {
+  const { phone, note } = req.body;
+  const phoneClean = (phone || '').trim();
+  if (!phoneClean) {
+    return res.status(400).json({ error: 'Falta el numero de telefono.' });
+  }
+  await query(
+    `INSERT INTO phone_overrides (phone, note) VALUES ($1, $2)
+     ON CONFLICT (phone) DO UPDATE SET note = $2, created_at = now()`,
+    [phoneClean, note || null]
+  );
+  res.json({ ok: true });
+});
+
 
 // Muestra toda la actividad de cargas de la plataforma (quien publico, a quien se le asigno, estado),
 // no solo lo de un shipper/carrier en particular. Trae las 150 mas recientes, con filtro opcional
