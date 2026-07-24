@@ -2637,6 +2637,53 @@ app.post('/api/admin/maintenance', requireAuth, requireAdmin, async (req, res) =
   res.json({ ok: true, maintenance: !!maintenance });
 });
 
+// Aviso general (banner deslizante) que el Admin puede publicar para que lo vean todos los
+// usuarios logueados en la app. Se guarda en la misma tabla platform_settings. Cada vez que se
+// publica (active=true), se genera un "id" nuevo - asi, si alguien ya habia cerrado un aviso
+// anterior, y el Admin le da "Publicar" de nuevo (aunque sea el mismo texto), se lo vuelve a
+// mostrar a todos.
+app.get('/api/announcement', async (req, res) => {
+  const result = await query(
+    `SELECT key, value FROM platform_settings WHERE key IN ('announcement_text', 'announcement_id', 'announcement_active')`
+  );
+  const settings = {};
+  result.rows.forEach((row) => { settings[row.key] = row.value; });
+  res.json({
+    active: settings.announcement_active === 'true',
+    text: settings.announcement_text || '',
+    id: settings.announcement_id || '',
+  });
+});
+
+app.post('/api/admin/announcement', requireAuth, requireAdmin, async (req, res) => {
+  const { text, active } = req.body;
+  const textClean = (text || '').trim();
+  if (active && !textClean) {
+    return res.status(400).json({ error: 'Escribe un mensaje antes de publicarlo.' });
+  }
+  const newId = String(Date.now());
+  await query(
+    `INSERT INTO platform_settings (key, value) VALUES ('announcement_text', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [textClean]
+  );
+  await query(
+    `INSERT INTO platform_settings (key, value) VALUES ('announcement_active', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [active ? 'true' : 'false']
+  );
+  if (active) {
+    // Solo generamos un id nuevo cuando se publica/activa - asi, si el Admin solo pausa y
+    // vuelve a activar el MISMO texto, no se le vuelve a mostrar a quien ya lo habia cerrado.
+    await query(
+      `INSERT INTO platform_settings (key, value) VALUES ('announcement_id', $1)
+       ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [newId]
+    );
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'cargasur-api' }));
 
 const port = process.env.PORT || 4000;
